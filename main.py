@@ -1,18 +1,20 @@
 """
 Dust Inspector — Basler camera dust-detection app
 --------------------------------------------------
-Single-file, minimalistic desktop app.
+Single-file, modern/sleek desktop app.
 
 Features:
   - Basler camera live feed (pypylon) OR Open Image (offline / no camera)
   - Multi-ROI selector: click to add a circular ROI, click inside a ROI to
     select it, scroll while hovering a SELECTED roi to grow/shrink it,
     scroll anywhere else to zoom the view (cursor anchored)
-  - Two-point calibration (Settings tab): click 2 points, enter real-world
+  - Two-point calibration (Settings page): click 2 points, enter real-world
     distance -> mm/px scale stored in settings.json
   - Detection algorithm is UNCHANGED from the reference: local Z-score
-    (boxFilter mean/std over a window) thresholded inside the ROI mask(s)
+    (boxFilter mean/std over a window) thresholded inside the ROI mask(s);
+    each dust blob is ringed in red in the final result
   - Binary mask output view, synced zoom/pan with the input view
+  - Sidebar navigation, card-based layout, dark modern theme
   - storage/ directory: images/, masks/, roi_configs/, settings.json
 
 Run:  python dust_inspector_app.py
@@ -38,7 +40,23 @@ except Exception:
     PYLON_AVAILABLE = False
 
 ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("green")
+
+# ------------------------------------------------------------------ theme --
+BG = "#0b0d10"
+BG_SIDEBAR = "#0e1013"
+BG_CARD = "#14171c"
+BG_CARD_ALT = "#1b1f26"
+BG_CANVAS = "#101317"
+BORDER = "#23272e"
+ACCENT = "#4f8cff"
+ACCENT_HOVER = "#3f74e0"
+ACCENT_SOFT = "#182337"
+TEXT = "#e6e8eb"
+TEXT_MUTED = "#8a919c"
+SUCCESS = "#22c55e"
+SUCCESS_HOVER = "#16a34a"
+DANGER = "#ef4444"
+WARNING = "#f59e0b"
 
 # ---------------------------------------------------------------- storage --
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -176,7 +194,8 @@ class CameraManager:
 # ---------------------------------------------------------------- detect ----
 def run_zscore_detection(bgr, rois, window, z_thr):
     """UNCHANGED algorithm: local Z-score via boxFilter mean/std, thresholded
-    inside the union of all circular ROI masks."""
+    inside the union of all circular ROI masks. Also returns a min-enclosing
+    circle for every connected dust blob, used to ring each one in red."""
     win = window if window % 2 == 1 else window + 1
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
@@ -191,17 +210,23 @@ def run_zscore_detection(bgr, rois, window, z_thr):
 
     binary = np.where((zscore >= z_thr) & (mask == 255), 255, 0).astype(np.uint8)
 
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    circles = []
+    for c in contours:
+        (cx, cy), r = cv2.minEnclosingCircle(c)
+        circles.append({"cx": float(cx), "cy": float(cy), "r": float(max(r, 3.0))})
+
     stats = None
     if mask.any():
         roi_z = zscore[mask == 255]
         stats = {"max_z": float(roi_z.max()), "mean_z": float(roi_z.mean()),
-                 "dust_px": int((binary == 255).sum())}
-    return binary, stats
+                 "dust_px": int((binary == 255).sum()), "dust_count": len(circles)}
+    return binary, circles, stats
 
 
 # -------------------------------------------------------------------- app --
-CANVAS_W = 520
-CANVAS_H = 520
+CANVAS_W = 470
+CANVAS_H = 470
 ROI_HIT_TOL = 6  # extra px tolerance (image space) for selecting a roi
 
 
@@ -209,13 +234,21 @@ class DustInspectorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Dust Inspector")
-        self.root.geometry("1180x760")
+        self.root.geometry("1300x820")
+        self.root.minsize(1050, 680)
+        self.root.configure(fg_color=BG)
+
+        self.f_title = ctk.CTkFont(size=20, weight="bold")
+        self.f_section = ctk.CTkFont(size=14, weight="bold")
+        self.f_body = ctk.CTkFont(size=13)
+        self.f_small = ctk.CTkFont(size=11)
 
         self.settings = load_settings()
         self.cam = CameraManager()
 
         self.original = None          # current BGR frame (live or opened)
         self.result_mask = None       # last binary mask (BGR for display)
+        self.dust_circles = []        # detected dust blobs, ringed in red
         self.rois = []                # list of {"cx","cy","r"}
         self.selected_idx = None
 
@@ -242,63 +275,174 @@ class DustInspectorApp:
 
         self.status = tk.StringVar(value="No image. Connect camera or Open Image.")
         self.scale_label_var = tk.StringVar(value=self._scale_text())
+        self.nav_buttons = {}
+        self.current_page = "inspect"
 
         self._build_ui()
+        self._update_cam_indicator()
         self._poll_live()
+
+    # -------------------------------------------------------- style helpers
+    def _btn_primary(self, parent, text, command, width=120):
+        return ctk.CTkButton(parent, text=text, command=command, width=width,
+                              corner_radius=8, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                              text_color="#ffffff", font=self.f_body)
+
+    def _btn_secondary(self, parent, text, command, width=110):
+        return ctk.CTkButton(parent, text=text, command=command, width=width,
+                              corner_radius=8, fg_color=BG_CARD_ALT, hover_color=BORDER,
+                              text_color=TEXT, font=self.f_body)
+
+    def _section_header(self, parent, text):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=18, pady=(16, 4))
+        ctk.CTkFrame(row, fg_color=ACCENT, width=4, height=18, corner_radius=2).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(row, text=text, font=self.f_section, text_color=TEXT).pack(side="left")
+        return row
+
+    def _field(self, parent, label_text, var, width=140):
+        f = ctk.CTkFrame(parent, fg_color="transparent")
+        ctk.CTkLabel(f, text=label_text, font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w")
+        ctk.CTkEntry(f, textvariable=var, width=width, corner_radius=8,
+                     fg_color=BG_CARD_ALT, border_color=BORDER, text_color=TEXT).pack(anchor="w", pady=(4, 0))
+        return f
+
+    def _card(self, parent, **kw):
+        defaults = dict(fg_color=BG_CARD, corner_radius=14, border_width=1, border_color=BORDER)
+        defaults.update(kw)
+        return ctk.CTkFrame(parent, **defaults)
 
     # ------------------------------------------------------------ layout --
     def _build_ui(self):
-        self.tabs = ctk.CTkTabview(self.root)
-        self.tabs.pack(fill="both", expand=True, padx=8, pady=8)
-        self.tab_inspect = self.tabs.add("Inspection")
-        self.tab_settings = self.tabs.add("Settings")
+        outer = ctk.CTkFrame(self.root, fg_color=BG, corner_radius=0)
+        outer.pack(fill="both", expand=True)
 
-        self._build_inspection_tab()
-        self._build_settings_tab()
+        container = ctk.CTkFrame(outer, fg_color=BG, corner_radius=0)
+        container.pack(fill="both", expand=True, side="top")
 
-    # ---- Inspection tab -------------------------------------------------
-    def _build_inspection_tab(self):
-        top = ctk.CTkFrame(self.tab_inspect)
-        top.pack(fill="x", padx=4, pady=(4, 2))
+        statusbar = ctk.CTkFrame(outer, fg_color=BG_SIDEBAR, corner_radius=0, height=32)
+        statusbar.pack(fill="x", side="bottom")
+        statusbar.pack_propagate(False)
+        ctk.CTkLabel(statusbar, text="●", text_color=TEXT_MUTED, font=self.f_small).pack(side="left", padx=(16, 6))
+        ctk.CTkLabel(statusbar, textvariable=self.status, text_color=TEXT_MUTED, font=self.f_small).pack(side="left")
 
-        ctk.CTkButton(top, text="Open Image", width=100, command=self.open_image).pack(side="left", padx=3)
-        ctk.CTkButton(top, text="Connect Cam", width=100, command=self.connect_camera).pack(side="left", padx=3)
-        self.live_btn = ctk.CTkButton(top, text="Start Live", width=90, command=self.toggle_live)
-        self.live_btn.pack(side="left", padx=3)
-        ctk.CTkCheckBox(top, text="Freeze", variable=self.freeze).pack(side="left", padx=6)
-        ctk.CTkCheckBox(top, text="Live Detect", variable=self.live_detect).pack(side="left", padx=6)
+        # ---- sidebar ----
+        sidebar = ctk.CTkFrame(container, width=176, fg_color=BG_SIDEBAR, corner_radius=0)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
 
-        ctk.CTkButton(top, text="Run Detection", width=110, command=self.run_detection).pack(side="left", padx=(12, 3))
-        ctk.CTkButton(top, text="Save Result", width=100, command=self.save_result).pack(side="left", padx=3)
+        logo = ctk.CTkFrame(sidebar, fg_color="transparent")
+        logo.pack(fill="x", padx=20, pady=(24, 28))
+        ctk.CTkLabel(logo, text="Dust", font=self.f_title, text_color=TEXT).pack(anchor="w")
+        ctk.CTkLabel(logo, text="Inspector", font=self.f_title, text_color=ACCENT).pack(anchor="w")
 
-        top2 = ctk.CTkFrame(self.tab_inspect)
-        top2.pack(fill="x", padx=4, pady=(0, 4))
-        ctk.CTkLabel(top2, text="ROI:").pack(side="left", padx=(4, 2))
-        ctk.CTkButton(top2, text="Delete Selected", width=110, command=self.delete_selected_roi).pack(side="left", padx=3)
-        ctk.CTkButton(top2, text="Clear All", width=80, command=self.clear_rois).pack(side="left", padx=3)
-        ctk.CTkButton(top2, text="Save Layout", width=95, command=self.save_roi_layout).pack(side="left", padx=3)
-        ctk.CTkButton(top2, text="Load Layout", width=95, command=self.load_roi_layout).pack(side="left", padx=3)
+        nav = ctk.CTkFrame(sidebar, fg_color="transparent")
+        nav.pack(fill="x", padx=12)
+        self._make_nav_button(nav, "inspect", "Inspection")
+        self._make_nav_button(nav, "settings", "Settings")
 
-        ctk.CTkButton(top2, text="Zoom In", width=70, command=lambda: self._zoom_btn(1.25)).pack(side="left", padx=(16, 2))
-        ctk.CTkButton(top2, text="Zoom Out", width=70, command=lambda: self._zoom_btn(0.8)).pack(side="left", padx=2)
-        ctk.CTkButton(top2, text="Fit", width=50, command=self.fit).pack(side="left", padx=2)
+        ctk.CTkFrame(sidebar, fg_color="transparent").pack(fill="both", expand=True)
 
-        ctk.CTkLabel(top2, textvariable=self.status).pack(side="left", padx=12)
+        chip = self._card(sidebar, corner_radius=10)
+        chip.pack(fill="x", padx=12, pady=16)
+        self.cam_dot = ctk.CTkLabel(chip, text="●", text_color=DANGER, font=self.f_body)
+        self.cam_dot.pack(side="left", padx=(12, 6), pady=10)
+        self.cam_chip_label = ctk.CTkLabel(chip, text="Camera offline", text_color=TEXT_MUTED, font=self.f_small)
+        self.cam_chip_label.pack(side="left", padx=(0, 10))
 
-        canvases = ctk.CTkFrame(self.tab_inspect)
-        canvases.pack(fill="both", expand=True, padx=4, pady=4)
+        # ---- content (pages stacked, switched via nav) ----
+        content = ctk.CTkFrame(container, fg_color=BG, corner_radius=0)
+        content.pack(side="left", fill="both", expand=True)
+        content.grid_rowconfigure(0, weight=1)
+        content.grid_columnconfigure(0, weight=1)
 
-        left = ctk.CTkFrame(canvases)
-        left.pack(side="left", padx=6, pady=6)
-        ctk.CTkLabel(left, text="INPUT  (click=add/select ROI, drag=pan, wheel=zoom)").pack()
-        self.ic = tk.Canvas(left, width=CANVAS_W, height=CANVAS_H, bg="#1a1a1a", highlightthickness=0)
-        self.ic.pack()
+        self.page_inspect = ctk.CTkFrame(content, fg_color=BG, corner_radius=0)
+        self.page_settings = ctk.CTkFrame(content, fg_color=BG, corner_radius=0)
+        self.page_inspect.grid(row=0, column=0, sticky="nsew")
+        self.page_settings.grid(row=0, column=0, sticky="nsew")
 
-        right = ctk.CTkFrame(canvases)
-        right.pack(side="left", padx=6, pady=6)
-        ctk.CTkLabel(right, text="BINARY MASK  (dust candidates)").pack()
-        self.mc = tk.Canvas(right, width=CANVAS_W, height=CANVAS_H, bg="#1a1a1a", highlightthickness=0)
-        self.mc.pack()
+        self._build_inspection_page()
+        self._build_settings_page()
+        self.switch_page("inspect")
+
+    def _make_nav_button(self, parent, key, label):
+        btn = ctk.CTkButton(parent, text=label, corner_radius=8, height=38,
+                             fg_color="transparent", hover_color=BG_CARD_ALT,
+                             text_color=TEXT_MUTED, font=self.f_body,
+                             command=lambda: self.switch_page(key))
+        btn.pack(fill="x", pady=4)
+        self.nav_buttons[key] = btn
+
+    def switch_page(self, key):
+        self.current_page = key
+        (self.page_inspect if key == "inspect" else self.page_settings).tkraise()
+        for k, b in self.nav_buttons.items():
+            if k == key:
+                b.configure(text_color=ACCENT, fg_color=ACCENT_SOFT)
+            else:
+                b.configure(text_color=TEXT_MUTED, fg_color="transparent")
+
+    # ---- Inspection page --------------------------------------------------
+    def _build_inspection_page(self):
+        pad = 18
+        p = self.page_inspect
+
+        ctk.CTkLabel(p, text="Inspection", font=self.f_title, text_color=TEXT).pack(
+            anchor="w", padx=pad, pady=(pad, 8))
+
+        toolbar = self._card(p)
+        toolbar.pack(fill="x", padx=pad, pady=(0, 8))
+
+        row1 = ctk.CTkFrame(toolbar, fg_color="transparent")
+        row1.pack(fill="x", padx=14, pady=(14, 6))
+        self._btn_primary(row1, "Open Image", self.open_image, width=110).pack(side="left", padx=(0, 8))
+        self._btn_secondary(row1, "Connect Cam", self.connect_camera, width=110).pack(side="left", padx=8)
+        self.live_btn = self._btn_secondary(row1, "Start Live", self.toggle_live, width=100)
+        self.live_btn.pack(side="left", padx=8)
+        ctk.CTkSwitch(row1, text="Freeze", variable=self.freeze, font=self.f_small,
+                      progress_color=ACCENT, text_color=TEXT_MUTED).pack(side="left", padx=(16, 8))
+        ctk.CTkSwitch(row1, text="Live Detect", variable=self.live_detect, font=self.f_small,
+                      progress_color=ACCENT, text_color=TEXT_MUTED).pack(side="left", padx=8)
+        self._btn_primary(row1, "Run Detection", self.run_detection, width=120).pack(side="right", padx=(8, 0))
+        self._btn_secondary(row1, "Save Result", self.save_result, width=100).pack(side="right", padx=8)
+
+        row2 = ctk.CTkFrame(toolbar, fg_color="transparent")
+        row2.pack(fill="x", padx=14, pady=(0, 14))
+        ctk.CTkLabel(row2, text="ROI", font=self.f_small, text_color=TEXT_MUTED).pack(side="left", padx=(0, 8))
+        self._btn_secondary(row2, "Delete", self.delete_selected_roi, width=80).pack(side="left", padx=4)
+        self._btn_secondary(row2, "Clear All", self.clear_rois, width=90).pack(side="left", padx=4)
+        self._btn_secondary(row2, "Save Layout", self.save_roi_layout, width=100).pack(side="left", padx=4)
+        self._btn_secondary(row2, "Load Layout", self.load_roi_layout, width=100).pack(side="left", padx=4)
+
+        self._btn_secondary(row2, "Fit", self.fit, width=52).pack(side="right", padx=4)
+        self._btn_secondary(row2, "Zoom Out", lambda: self._zoom_btn(0.8), width=80).pack(side="right", padx=4)
+        self._btn_secondary(row2, "Zoom In", lambda: self._zoom_btn(1.25), width=80).pack(side="right", padx=(16, 4))
+
+        canvases = ctk.CTkFrame(p, fg_color="transparent")
+        canvases.pack(fill="both", expand=True, padx=pad, pady=(4, pad))
+        canvases.grid_columnconfigure(0, weight=1)
+        canvases.grid_columnconfigure(1, weight=1)
+        canvases.grid_rowconfigure(0, weight=1)
+
+        left_card = self._card(canvases)
+        left_card.grid(row=0, column=0, padx=(0, 8), sticky="nsew")
+        self._section_header(left_card, "Input")
+        ctk.CTkLabel(left_card, text="click = add/select ROI  •  drag = pan  •  wheel = zoom",
+                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 10))
+        wrap1 = ctk.CTkFrame(left_card, fg_color=BG_CANVAS, corner_radius=10)
+        wrap1.pack(padx=18, pady=(0, 18))
+        self.ic = tk.Canvas(wrap1, width=CANVAS_W, height=CANVAS_H, bg=BG_CANVAS, highlightthickness=0)
+        self.ic.pack(padx=3, pady=3)
+
+        right_card = self._card(canvases)
+        right_card.grid(row=0, column=1, padx=(8, 0), sticky="nsew")
+        self._section_header(right_card, "Binary Mask")
+        ctk.CTkLabel(right_card, text="white = dust candidate  •  red ring = detected blob",
+                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 10))
+        wrap2 = ctk.CTkFrame(right_card, fg_color=BG_CANVAS, corner_radius=10)
+        wrap2.pack(padx=18, pady=(0, 18))
+        self.mc = tk.Canvas(wrap2, width=CANVAS_W, height=CANVAS_H, bg=BG_CANVAS, highlightthickness=0)
+        self.mc.pack(padx=3, pady=3)
 
         for cv_ in (self.ic, self.mc):
             cv_.bind("<MouseWheel>", self.on_wheel)
@@ -311,54 +455,71 @@ class DustInspectorApp:
         self.mc.bind("<ButtonRelease-1>", self.on_release_other)
         self.root.bind("<Delete>", lambda e: self.delete_selected_roi())
 
-    # ---- Settings tab -----------------------------------------------------
-    def _build_settings_tab(self):
-        cam_frame = ctk.CTkFrame(self.tab_settings)
-        cam_frame.pack(fill="x", padx=10, pady=10)
-        ctk.CTkLabel(cam_frame, text="Camera", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w", padx=6, pady=4)
+    # ---- Settings page -----------------------------------------------------
+    def _build_settings_page(self):
+        pad = 18
+        p = self.page_settings
+        ctk.CTkLabel(p, text="Settings", font=self.f_title, text_color=TEXT).pack(
+            anchor="w", padx=pad, pady=(pad, 8))
+
+        cam_card = self._card(p)
+        cam_card.pack(fill="x", padx=pad, pady=8)
+        head = ctk.CTkFrame(cam_card, fg_color="transparent")
+        head.pack(fill="x", padx=18, pady=(16, 0))
+        ctk.CTkFrame(head, fg_color=ACCENT, width=4, height=18, corner_radius=2).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(head, text="Camera", font=self.f_section, text_color=TEXT).pack(side="left")
         self.cam_status_var = tk.StringVar(value="Not connected")
-        ctk.CTkLabel(cam_frame, textvariable=self.cam_status_var).grid(row=0, column=1, sticky="w", padx=6)
+        ctk.CTkLabel(head, textvariable=self.cam_status_var, font=self.f_small, text_color=TEXT_MUTED).pack(side="right")
 
-        ctk.CTkLabel(cam_frame, text="Exposure (us):").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        cam_body = ctk.CTkFrame(cam_card, fg_color="transparent")
+        cam_body.pack(fill="x", padx=18, pady=(10, 18))
         self.exposure_var = tk.StringVar(value=str(self.settings["exposure_us"]))
-        ctk.CTkEntry(cam_frame, textvariable=self.exposure_var, width=100).grid(row=1, column=1, sticky="w", padx=6)
-
-        ctk.CTkLabel(cam_frame, text="Gain:").grid(row=2, column=0, sticky="w", padx=6, pady=4)
         self.gain_var = tk.StringVar(value=str(self.settings["gain"]))
-        ctk.CTkEntry(cam_frame, textvariable=self.gain_var, width=100).grid(row=2, column=1, sticky="w", padx=6)
+        self._field(cam_body, "Exposure (µs)", self.exposure_var).pack(side="left", padx=(0, 20))
+        self._field(cam_body, "Gain", self.gain_var).pack(side="left", padx=(0, 20))
+        self._btn_primary(cam_body, "Apply", self.apply_camera_settings, width=90).pack(side="left", pady=(18, 0))
 
-        ctk.CTkButton(cam_frame, text="Apply to Camera", command=self.apply_camera_settings).grid(row=1, column=2, rowspan=2, padx=10)
-
-        det_frame = ctk.CTkFrame(self.tab_settings)
-        det_frame.pack(fill="x", padx=10, pady=10)
-        ctk.CTkLabel(det_frame, text="Detection", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w", padx=6, pady=4)
-
-        ctk.CTkLabel(det_frame, text="Window size:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        det_card = self._card(p)
+        det_card.pack(fill="x", padx=pad, pady=8)
+        self._section_header(det_card, "Detection")
+        det_body = ctk.CTkFrame(det_card, fg_color="transparent")
+        det_body.pack(fill="x", padx=18, pady=(6, 18))
         self.window_var = tk.StringVar(value=str(self.settings["window"]))
-        ctk.CTkEntry(det_frame, textvariable=self.window_var, width=80).grid(row=1, column=1, sticky="w", padx=6)
-
-        ctk.CTkLabel(det_frame, text="Z threshold:").grid(row=2, column=0, sticky="w", padx=6, pady=4)
         self.zthr_var = tk.StringVar(value=str(self.settings["z_thr"]))
-        ctk.CTkEntry(det_frame, textvariable=self.zthr_var, width=80).grid(row=2, column=1, sticky="w", padx=6)
-
-        ctk.CTkLabel(det_frame, text="Default ROI radius (px):").grid(row=3, column=0, sticky="w", padx=6, pady=4)
         self.radius_var = tk.StringVar(value=str(self.settings["default_radius"]))
-        ctk.CTkEntry(det_frame, textvariable=self.radius_var, width=80).grid(row=3, column=1, sticky="w", padx=6)
+        self._field(det_body, "Window size", self.window_var, width=90).pack(side="left", padx=(0, 20))
+        self._field(det_body, "Z threshold", self.zthr_var, width=90).pack(side="left", padx=(0, 20))
+        self._field(det_body, "Default ROI radius (px)", self.radius_var, width=110).pack(side="left", padx=(0, 20))
+        self._btn_primary(det_body, "Save Settings", self.save_detection_settings, width=120).pack(side="left", pady=(18, 0))
 
-        ctk.CTkButton(det_frame, text="Save Settings", command=self.save_detection_settings).grid(row=1, column=2, rowspan=3, padx=10)
-
-        calib_frame = ctk.CTkFrame(self.tab_settings)
-        calib_frame.pack(fill="x", padx=10, pady=10)
-        ctk.CTkLabel(calib_frame, text="Two-Point Calibration", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, sticky="w", padx=6, pady=4, columnspan=2)
-        ctk.CTkLabel(calib_frame, text="Click 2 points on the image with a known real-world distance.").grid(row=1, column=0, sticky="w", padx=6, columnspan=3)
-        ctk.CTkButton(calib_frame, text="Start Calibration", command=self.start_calibration).grid(row=2, column=0, padx=6, pady=6)
-        ctk.CTkButton(calib_frame, text="Reset Calibration", command=self.reset_calibration).grid(row=2, column=1, padx=6, pady=6)
-        ctk.CTkLabel(calib_frame, textvariable=self.scale_label_var).grid(row=2, column=2, padx=10)
+        calib_card = self._card(p)
+        calib_card.pack(fill="x", padx=pad, pady=8)
+        self._section_header(calib_card, "Two-Point Calibration")
+        ctk.CTkLabel(calib_card, text="Click 2 points on the image with a known real-world distance.",
+                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 10))
+        calib_body = ctk.CTkFrame(calib_card, fg_color="transparent")
+        calib_body.pack(fill="x", padx=18, pady=(0, 18))
+        self._btn_primary(calib_body, "Start Calibration", self.start_calibration, width=140).pack(side="left", padx=(0, 8))
+        self._btn_secondary(calib_body, "Reset", self.reset_calibration, width=90).pack(side="left", padx=8)
+        ctk.CTkLabel(calib_body, textvariable=self.scale_label_var, font=self.f_small,
+                     text_color=TEXT_MUTED).pack(side="left", padx=16)
 
     # ------------------------------------------------------------ camera --
+    def _update_cam_indicator(self):
+        if self.cam.connected and self.live_on:
+            self.cam_dot.configure(text_color=SUCCESS)
+            self.cam_chip_label.configure(text="Live", text_color=TEXT)
+        elif self.cam.connected:
+            self.cam_dot.configure(text_color=WARNING)
+            self.cam_chip_label.configure(text="Connected", text_color=TEXT)
+        else:
+            self.cam_dot.configure(text_color=DANGER)
+            self.cam_chip_label.configure(text="Camera offline", text_color=TEXT_MUTED)
+
     def connect_camera(self):
         ok, msg = self.cam.connect()
         self.cam_status_var.set(msg)
+        self._update_cam_indicator()
         if ok:
             self.apply_camera_settings()
             self.status.set("Camera connected.")
@@ -385,13 +546,16 @@ class DustInspectorApp:
         if not self.live_on:
             self.cam.start_live()
             self.live_on = True
-            self.live_btn.configure(text="Stop Live")
+            self.live_btn.configure(text="Stop Live", fg_color=SUCCESS,
+                                     hover_color=SUCCESS_HOVER, text_color="#ffffff")
             self.status.set("Live feed running.")
         else:
             self.cam.stop_live()
             self.live_on = False
-            self.live_btn.configure(text="Start Live")
+            self.live_btn.configure(text="Start Live", fg_color=BG_CARD_ALT,
+                                     hover_color=BORDER, text_color=TEXT)
             self.status.set("Live feed stopped.")
+        self._update_cam_indicator()
 
     def _poll_live(self):
         if self.live_on and not self.freeze.get():
@@ -420,6 +584,7 @@ class DustInspectorApp:
             self.toggle_live()
         self.original = img
         self.result_mask = None
+        self.dust_circles = []
         self.mc.delete("all")
         self.fit()
         self.status.set(f"Loaded {os.path.basename(path)}. Add ROI(s) then Run Detection.")
@@ -433,7 +598,10 @@ class DustInspectorApp:
         cv2.imwrite(img_path, self.original)
         if self.result_mask is not None:
             mask_path = os.path.join(MASKS_DIR, f"mask_{ts}.png")
-            cv2.imwrite(mask_path, self.result_mask)
+            annotated = self.result_mask.copy()
+            for d in self.dust_circles:
+                cv2.circle(annotated, (int(d["cx"]), int(d["cy"])), int(round(d["r"])) + 4, (0, 0, 255), 2)
+            cv2.imwrite(mask_path, annotated)
             self.status.set(f"Saved {os.path.basename(img_path)} + {os.path.basename(mask_path)}")
         else:
             self.status.set(f"Saved {os.path.basename(img_path)} (no mask yet)")
@@ -480,19 +648,22 @@ class DustInspectorApp:
             self.status.set("Load an image and add at least one ROI first.")
             return
         win, z_thr = self._current_params()
-        binary, stats = run_zscore_detection(self.original, self.rois, win, z_thr)
+        binary, circles, stats = run_zscore_detection(self.original, self.rois, win, z_thr)
         self.result_mask = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        self.dust_circles = circles
         self._refresh()
         if stats:
             self.status.set(
-                f"Done. z_thr={z_thr}, max_z={stats['max_z']:.2f}, dust_px={stats['dust_px']}")
+                f"Done. z_thr={z_thr}, max_z={stats['max_z']:.2f}, "
+                f"dust_count={stats['dust_count']}, dust_px={stats['dust_px']}")
         else:
             self.status.set("Done, but ROI mask was empty.")
 
     def _run_detection_silent(self):
         win, z_thr = self._current_params()
-        binary, _ = run_zscore_detection(self.original, self.rois, win, z_thr)
+        binary, circles, _ = run_zscore_detection(self.original, self.rois, win, z_thr)
         self.result_mask = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        self.dust_circles = circles
 
     def save_detection_settings(self):
         try:
@@ -512,7 +683,7 @@ class DustInspectorApp:
             return
         self.calib_mode = True
         self.calib_points = []
-        self.tabs.set("Inspection")
+        self.switch_page("inspect")
         self.status.set("Calibration: click 2 points at a known real-world distance.")
 
     def reset_calibration(self):
@@ -607,7 +778,6 @@ class DustInspectorApp:
             return
         direction = 1 if (getattr(event, "delta", 0) > 0 or getattr(event, "num", None) == 4) else -1
 
-        # if a ROI is selected and the cursor is hovering it -> resize instead of zoom
         if self.selected_idx is not None:
             ix, iy = self._screen_to_image(event.x, event.y)
             roi = self.rois[self.selected_idx]
@@ -713,6 +883,8 @@ class DustInspectorApp:
         for i, roi in enumerate(self.rois):
             color = (0, 255, 255) if i == self.selected_idx else (0, 150, 0)
             cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), color, 1)
+        for d in self.dust_circles:
+            cv2.circle(disp, (int(d["cx"]), int(d["cy"])), int(round(d["r"])) + 4, (0, 0, 255), 2)
         return disp
 
     def _render(self, canvas, bgr, attr):
@@ -753,4 +925,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
