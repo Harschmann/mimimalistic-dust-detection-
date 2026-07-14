@@ -76,6 +76,8 @@ DEFAULT_SETTINGS = {
     "scale_mm_per_px": None,
     "exposure_us": 20000.0,
     "gain": 0.0,
+    "min_area": 4.0,
+    "min_circularity": 0.55,
 }
 
 
@@ -192,10 +194,21 @@ class CameraManager:
 
 
 # ---------------------------------------------------------------- detect ----
-def run_zscore_detection(bgr, rois, window, z_thr):
-    """UNCHANGED algorithm: local Z-score via boxFilter mean/std, thresholded
-    inside the union of all circular ROI masks. Also returns a min-enclosing
-    circle for every connected dust blob, used to ring each one in red."""
+def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity=0.55):
+    """Core Z-score math is UNCHANGED: local Z-score via boxFilter mean/std,
+    thresholded inside the union of all circular ROI masks.
+
+    On top of that, two shape-based filters clean up the raw threshold:
+      - a small morphological opening erases anything thinner than a few px
+        (this kills thin curved edge artifacts / arcs and 1-2px sensor noise,
+        since a real dust speck is round and a few px wide, an arc isn't)
+      - a circularity + min-area check on the surviving blobs drops anything
+        that's still elongated/thin (residual arc fragments) or too small to
+        be a real particle (min_area, min_circularity are tunable in Settings)
+
+    Returns the cleaned binary mask, one min-enclosing circle per accepted
+    dust blob (used to ring it in red), and summary stats.
+    """
     win = window if window % 2 == 1 else window + 1
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
@@ -208,19 +221,35 @@ def run_zscore_detection(bgr, rois, window, z_thr):
     for roi in rois:
         cv2.circle(mask, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), 255, -1)
 
-    binary = np.where((zscore >= z_thr) & (mask == 255), 255, 0).astype(np.uint8)
+    raw = np.where((zscore >= z_thr) & (mask == 255), 255, 0).astype(np.uint8)
 
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    opened = cv2.morphologyEx(raw, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     circles = []
+    binary = np.zeros_like(opened)
+    rejected = 0
     for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_area:
+            rejected += 1
+            continue
+        perimeter = cv2.arcLength(c, True)
+        circularity = (4 * np.pi * area / (perimeter * perimeter)) if perimeter > 0 else 0.0
+        if circularity < min_circularity:
+            rejected += 1
+            continue
         (cx, cy), r = cv2.minEnclosingCircle(c)
         circles.append({"cx": float(cx), "cy": float(cy), "r": float(max(r, 3.0))})
+        cv2.drawContours(binary, [c], -1, 255, -1)
 
     stats = None
     if mask.any():
         roi_z = zscore[mask == 255]
         stats = {"max_z": float(roi_z.max()), "mean_z": float(roi_z.mean()),
-                 "dust_px": int((binary == 255).sum()), "dust_count": len(circles)}
+                 "dust_px": int((binary == 255).sum()), "dust_count": len(circles),
+                 "rejected": rejected}
     return binary, circles, stats
 
 
@@ -487,10 +516,16 @@ class DustInspectorApp:
         self.window_var = tk.StringVar(value=str(self.settings["window"]))
         self.zthr_var = tk.StringVar(value=str(self.settings["z_thr"]))
         self.radius_var = tk.StringVar(value=str(self.settings["default_radius"]))
-        self._field(det_body, "Window size", self.window_var, width=90).pack(side="left", padx=(0, 20))
-        self._field(det_body, "Z threshold", self.zthr_var, width=90).pack(side="left", padx=(0, 20))
-        self._field(det_body, "Default ROI radius (px)", self.radius_var, width=110).pack(side="left", padx=(0, 20))
+        self.min_area_var = tk.StringVar(value=str(self.settings["min_area"]))
+        self.min_circ_var = tk.StringVar(value=str(self.settings["min_circularity"]))
+        self._field(det_body, "Window size", self.window_var, width=80).pack(side="left", padx=(0, 16))
+        self._field(det_body, "Z threshold", self.zthr_var, width=80).pack(side="left", padx=(0, 16))
+        self._field(det_body, "Default ROI radius (px)", self.radius_var, width=100).pack(side="left", padx=(0, 16))
+        self._field(det_body, "Min blob area (px²)", self.min_area_var, width=90).pack(side="left", padx=(0, 16))
+        self._field(det_body, "Min circularity (0-1)", self.min_circ_var, width=100).pack(side="left", padx=(0, 16))
         self._btn_primary(det_body, "Save Settings", self.save_detection_settings, width=120).pack(side="left", pady=(18, 0))
+        ctk.CTkLabel(det_card, text="Circularity ~1 = round dust speck. Arcs / thin edge glints score low — raise this to reject them.",
+                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 14))
 
         calib_card = self._card(p)
         calib_card.pack(fill="x", padx=pad, pady=8)
@@ -641,27 +676,38 @@ class DustInspectorApp:
             z_thr = float(self.zthr_var.get())
         except ValueError:
             z_thr = self.settings["z_thr"]
-        return win, z_thr
+        try:
+            min_area = float(self.min_area_var.get())
+        except ValueError:
+            min_area = self.settings["min_area"]
+        try:
+            min_circ = float(self.min_circ_var.get())
+        except ValueError:
+            min_circ = self.settings["min_circularity"]
+        return win, z_thr, min_area, min_circ
 
     def run_detection(self):
         if self.original is None or not self.rois:
             self.status.set("Load an image and add at least one ROI first.")
             return
-        win, z_thr = self._current_params()
-        binary, circles, stats = run_zscore_detection(self.original, self.rois, win, z_thr)
+        win, z_thr, min_area, min_circ = self._current_params()
+        binary, circles, stats = run_zscore_detection(
+            self.original, self.rois, win, z_thr, min_area, min_circ)
         self.result_mask = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
         self.dust_circles = circles
         self._refresh()
         if stats:
             self.status.set(
                 f"Done. z_thr={z_thr}, max_z={stats['max_z']:.2f}, "
-                f"dust_count={stats['dust_count']}, dust_px={stats['dust_px']}")
+                f"dust_count={stats['dust_count']}, dust_px={stats['dust_px']}, "
+                f"arcs/noise filtered={stats['rejected']}")
         else:
             self.status.set("Done, but ROI mask was empty.")
 
     def _run_detection_silent(self):
-        win, z_thr = self._current_params()
-        binary, circles, _ = run_zscore_detection(self.original, self.rois, win, z_thr)
+        win, z_thr, min_area, min_circ = self._current_params()
+        binary, circles, _ = run_zscore_detection(
+            self.original, self.rois, win, z_thr, min_area, min_circ)
         self.result_mask = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
         self.dust_circles = circles
 
@@ -670,8 +716,10 @@ class DustInspectorApp:
             self.settings["window"] = int(self.window_var.get())
             self.settings["z_thr"] = float(self.zthr_var.get())
             self.settings["default_radius"] = int(self.radius_var.get())
+            self.settings["min_area"] = float(self.min_area_var.get())
+            self.settings["min_circularity"] = float(self.min_circ_var.get())
         except ValueError:
-            messagebox.showerror("Settings", "Window/Z-threshold/Radius must be numbers.")
+            messagebox.showerror("Settings", "Detection fields must be numbers.")
             return
         save_settings(self.settings)
         self.status.set("Detection settings saved.")
