@@ -11,11 +11,15 @@ Features:
   - Two-point calibration (Settings page): click 2 points, enter real-world
     distance -> mm/px scale stored in settings.json
   - Detection algorithm is UNCHANGED from the reference: local Z-score
-    (boxFilter mean/std over a window) thresholded inside the ROI mask(s);
-    each dust blob is ringed in red in the final result
-  - Binary mask output view, synced zoom/pan with the input view
-  - Sidebar navigation, card-based layout, dark modern theme
-  - storage/ directory: images/, masks/, roi_configs/, settings.json
+    (boxFilter mean/std over a window) thresholded inside the ROI mask(s),
+    then cleaned up with a morphological opening + circularity/area filter
+    so thin curved edge artifacts (arcs) and tiny noise specks are dropped
+  - Result view shows the ORIGINAL image with each dust blob ringed in red
+    (no raw binary mask shown) — runs on a background thread so Live Detect
+    doesn't stall the camera feed
+  - Sidebar navigation, card-based layout, dark modern theme, feed canvases
+    resize to fill the window
+  - storage/ directory: images/, results/, roi_configs/, settings.json
 
 Run:  python dust_inspector_app.py
 """
@@ -62,11 +66,11 @@ WARNING = "#f59e0b"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 IMAGES_DIR = os.path.join(STORAGE_DIR, "images")
-MASKS_DIR = os.path.join(STORAGE_DIR, "masks")
+RESULTS_DIR = os.path.join(STORAGE_DIR, "results")
 ROI_DIR = os.path.join(STORAGE_DIR, "roi_configs")
 SETTINGS_PATH = os.path.join(STORAGE_DIR, "settings.json")
 
-for _d in (STORAGE_DIR, IMAGES_DIR, MASKS_DIR, ROI_DIR):
+for _d in (STORAGE_DIR, IMAGES_DIR, RESULTS_DIR, ROI_DIR):
     os.makedirs(_d, exist_ok=True)
 
 DEFAULT_SETTINGS = {
@@ -254,8 +258,8 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
 
 
 # -------------------------------------------------------------------- app --
-CANVAS_W = 470
-CANVAS_H = 470
+CANVAS_W = 560   # fallback size, used only before the widget has real layout
+CANVAS_H = 560
 ROI_HIT_TOL = 6  # extra px tolerance (image space) for selecting a roi
 
 
@@ -263,8 +267,8 @@ class DustInspectorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Dust Inspector")
-        self.root.geometry("1300x820")
-        self.root.minsize(1050, 680)
+        self.root.geometry("1620x980")
+        self.root.minsize(1200, 760)
         self.root.configure(fg_color=BG)
 
         self.f_title = ctk.CTkFont(size=20, weight="bold")
@@ -300,7 +304,7 @@ class DustInspectorApp:
         self._hover_img = (0, 0)
 
         self.input_photo = None
-        self.mask_photo = None
+        self.result_photo = None
 
         self.status = tk.StringVar(value="No image. Connect camera or Open Image.")
         self.scale_label_var = tk.StringVar(value=self._scale_text())
@@ -310,6 +314,7 @@ class DustInspectorApp:
         self._build_ui()
         self._update_cam_indicator()
         self._poll_live()
+        threading.Thread(target=self._live_detect_loop, daemon=True).start()
 
     # -------------------------------------------------------- style helpers
     def _btn_primary(self, parent, text, command, width=120):
@@ -443,6 +448,15 @@ class DustInspectorApp:
         self._btn_secondary(row2, "Save Layout", self.save_roi_layout, width=100).pack(side="left", padx=4)
         self._btn_secondary(row2, "Load Layout", self.load_roi_layout, width=100).pack(side="left", padx=4)
 
+        self.zoom_pct_var = tk.StringVar(value="100%")
+        ctk.CTkLabel(row2, text="Digital Zoom", font=self.f_small, text_color=TEXT_MUTED).pack(side="left", padx=(20, 6))
+        self.zoom_slider = ctk.CTkSlider(row2, from_=25, to=800, number_of_steps=155, width=160,
+                                          progress_color=ACCENT, button_color=ACCENT,
+                                          button_hover_color=ACCENT_HOVER, command=self._on_zoom_slider)
+        self.zoom_slider.set(100)
+        self.zoom_slider.pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(row2, textvariable=self.zoom_pct_var, font=self.f_small, text_color=TEXT, width=44).pack(side="left")
+
         self._btn_secondary(row2, "Fit", self.fit, width=52).pack(side="right", padx=4)
         self._btn_secondary(row2, "Zoom Out", lambda: self._zoom_btn(0.8), width=80).pack(side="right", padx=4)
         self._btn_secondary(row2, "Zoom In", lambda: self._zoom_btn(1.25), width=80).pack(side="right", padx=(16, 4))
@@ -459,19 +473,19 @@ class DustInspectorApp:
         ctk.CTkLabel(left_card, text="click = add/select ROI  •  drag = pan  •  wheel = zoom",
                      font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 10))
         wrap1 = ctk.CTkFrame(left_card, fg_color=BG_CANVAS, corner_radius=10)
-        wrap1.pack(padx=18, pady=(0, 18))
-        self.ic = tk.Canvas(wrap1, width=CANVAS_W, height=CANVAS_H, bg=BG_CANVAS, highlightthickness=0)
-        self.ic.pack(padx=3, pady=3)
+        wrap1.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        self.ic = tk.Canvas(wrap1, bg=BG_CANVAS, highlightthickness=0)
+        self.ic.pack(fill="both", expand=True, padx=3, pady=3)
 
         right_card = self._card(canvases)
         right_card.grid(row=0, column=1, padx=(8, 0), sticky="nsew")
-        self._section_header(right_card, "Binary Mask")
-        ctk.CTkLabel(right_card, text="white = dust candidate  •  red ring = detected blob",
+        self._section_header(right_card, "Detection Result")
+        ctk.CTkLabel(right_card, text="original image  •  red ring = detected dust",
                      font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 10))
         wrap2 = ctk.CTkFrame(right_card, fg_color=BG_CANVAS, corner_radius=10)
-        wrap2.pack(padx=18, pady=(0, 18))
-        self.mc = tk.Canvas(wrap2, width=CANVAS_W, height=CANVAS_H, bg=BG_CANVAS, highlightthickness=0)
-        self.mc.pack(padx=3, pady=3)
+        wrap2.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+        self.mc = tk.Canvas(wrap2, bg=BG_CANVAS, highlightthickness=0)
+        self.mc.pack(fill="both", expand=True, padx=3, pady=3)
 
         for cv_ in (self.ic, self.mc):
             cv_.bind("<MouseWheel>", self.on_wheel)
@@ -480,6 +494,7 @@ class DustInspectorApp:
             cv_.bind("<ButtonPress-1>", self.on_press)
             cv_.bind("<B1-Motion>", self.on_drag)
             cv_.bind("<Motion>", self.on_hover)
+            cv_.bind("<Configure>", lambda e: self._refresh())
         self.ic.bind("<ButtonRelease-1>", self.on_release_input)
         self.mc.bind("<ButtonRelease-1>", self.on_release_other)
         self.root.bind("<Delete>", lambda e: self.delete_selected_roi())
@@ -507,6 +522,8 @@ class DustInspectorApp:
         self._field(cam_body, "Exposure (µs)", self.exposure_var).pack(side="left", padx=(0, 20))
         self._field(cam_body, "Gain", self.gain_var).pack(side="left", padx=(0, 20))
         self._btn_primary(cam_body, "Apply", self.apply_camera_settings, width=90).pack(side="left", pady=(18, 0))
+        ctk.CTkLabel(cam_card, text="Gain amplifies sensor noise along with brightness — prefer raising Exposure over Gain to avoid extra fake dust.",
+                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 14))
 
         det_card = self._card(p)
         det_card.pack(fill="x", padx=pad, pady=8)
@@ -600,10 +617,24 @@ class DustInspectorApp:
                 self.original = frame
                 if first:
                     self.fit()
-                if self.live_detect.get() and self.rois:
-                    self._run_detection_silent()
                 self._refresh()
         self.root.after(120, self._poll_live)
+
+    def _live_detect_loop(self):
+        """Runs on its own thread so a slow detection pass (big window,
+        morphology, contours on a full-res frame) never blocks the camera
+        feed or the UI. The result panel just picks up whatever this loop
+        last produced — it may trail the raw video by a frame or two, which
+        is expected and fine for a preview."""
+        while True:
+            if self.live_detect.get() and self.original is not None and self.rois:
+                try:
+                    self._run_detection_silent()
+                except Exception:
+                    pass
+                time.sleep(0.03)
+            else:
+                time.sleep(0.1)
 
     # -------------------------------------------------------------- I/O ---
     def open_image(self):
@@ -631,15 +662,13 @@ class DustInspectorApp:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         img_path = os.path.join(IMAGES_DIR, f"capture_{ts}.png")
         cv2.imwrite(img_path, self.original)
-        if self.result_mask is not None:
-            mask_path = os.path.join(MASKS_DIR, f"mask_{ts}.png")
-            annotated = self.result_mask.copy()
-            for d in self.dust_circles:
-                cv2.circle(annotated, (int(d["cx"]), int(d["cy"])), int(round(d["r"])) + 4, (0, 0, 255), 2)
-            cv2.imwrite(mask_path, annotated)
-            self.status.set(f"Saved {os.path.basename(img_path)} + {os.path.basename(mask_path)}")
+        result_disp = self._build_result_disp()
+        if result_disp is not None:
+            result_path = os.path.join(RESULTS_DIR, f"result_{ts}.png")
+            cv2.imwrite(result_path, result_disp)
+            self.status.set(f"Saved {os.path.basename(img_path)} + {os.path.basename(result_path)}")
         else:
-            self.status.set(f"Saved {os.path.basename(img_path)} (no mask yet)")
+            self.status.set(f"Saved {os.path.basename(img_path)}")
 
     def save_roi_layout(self):
         if not self.rois:
@@ -786,15 +815,22 @@ class DustInspectorApp:
         self.status.set("All ROIs cleared.")
 
     # --------------------------------------------------------- zoom / pan --
+    def _canvas_wh(self):
+        w, h = self.ic.winfo_width(), self.ic.winfo_height()
+        if w < 10 or h < 10:
+            return CANVAS_W, CANVAS_H
+        return w, h
+
     def fit(self):
         if self.original is None:
             return
+        cw, ch = self._canvas_wh()
         h, w = self.original.shape[:2]
-        self.base_scale = min(CANVAS_W / w, CANVAS_H / h)
+        self.base_scale = min(cw / w, ch / h)
         self.zoom = 1.0
         s = self.base_scale
-        self.view_x = (CANVAS_W - w * s) / 2
-        self.view_y = (CANVAS_H - h * s) / 2
+        self.view_x = (cw - w * s) / 2
+        self.view_y = (ch - h * s) / 2
         self._refresh()
 
     def _apply_zoom(self, factor, cx, cy):
@@ -810,7 +846,16 @@ class DustInspectorApp:
         self._refresh()
 
     def _zoom_btn(self, factor):
-        self._apply_zoom(factor, CANVAS_W / 2, CANVAS_H / 2)
+        cw, ch = self._canvas_wh()
+        self._apply_zoom(factor, cw / 2, ch / 2)
+
+    def _on_zoom_slider(self, value):
+        if self.original is None or self.zoom <= 0:
+            return
+        target = max(0.1, min(float(value) / 100.0, 60.0))
+        factor = target / self.zoom
+        cw, ch = self._canvas_wh()
+        self._apply_zoom(factor, cw / 2, ch / 2)
 
     def _screen_to_image(self, x, y):
         s = self.base_scale * self.zoom
@@ -924,10 +969,10 @@ class DustInspectorApp:
             cv2.line(disp, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 255), 2)
         return disp
 
-    def _build_mask_disp(self):
-        if self.result_mask is None:
+    def _build_result_disp(self):
+        if self.original is None:
             return None
-        disp = self.result_mask.copy()
+        disp = self.original.copy()
         for i, roi in enumerate(self.rois):
             color = (0, 255, 255) if i == self.selected_idx else (0, 150, 0)
             cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), color, 1)
@@ -939,19 +984,22 @@ class DustInspectorApp:
         canvas.delete("all")
         if bgr is None:
             return
+        cw_canvas, ch_canvas = canvas.winfo_width(), canvas.winfo_height()
+        if cw_canvas < 10 or ch_canvas < 10:
+            cw_canvas, ch_canvas = CANVAS_W, CANVAS_H
         H, W = bgr.shape[:2]
         s = self.base_scale * self.zoom
         vx, vy = self.view_x, self.view_y
         l = max(0, int(-vx / s))
         t = max(0, int(-vy / s))
-        r = min(W, int((CANVAS_W - vx) / s) + 1)
-        b = min(H, int((CANVAS_H - vy) / s) + 1)
+        r = min(W, int((cw_canvas - vx) / s) + 1)
+        b = min(H, int((ch_canvas - vy) / s) + 1)
         if r <= l or b <= t:
             return
         crop = bgr[t:b, l:r]
         cw = max(1, int((r - l) * s))
         ch = max(1, int((b - t) * s))
-        interp = cv2.INTER_NEAREST if self.zoom > 1.5 else cv2.INTER_AREA
+        interp = cv2.INTER_CUBIC if self.zoom > 1.0 else cv2.INTER_AREA
         resized = cv2.resize(crop, (cw, ch), interpolation=interp)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         photo = ImageTk.PhotoImage(Image.fromarray(rgb))
@@ -962,7 +1010,10 @@ class DustInspectorApp:
         if self.original is None:
             return
         self._render(self.ic, self._build_input_disp(), "input_photo")
-        self._render(self.mc, self._build_mask_disp(), "mask_photo")
+        self._render(self.mc, self._build_result_disp(), "result_photo")
+        pct = self.zoom * 100
+        self.zoom_pct_var.set(f"{pct:.0f}%")
+        self.zoom_slider.set(max(25, min(pct, 800)))
 
 
 def main():
