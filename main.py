@@ -28,6 +28,7 @@ import os
 import json
 import time
 import threading
+from collections import deque
 from datetime import datetime
 
 import cv2
@@ -261,6 +262,8 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
 CANVAS_W = 560   # fallback size, used only before the widget has real layout
 CANVAS_H = 560
 ROI_HIT_TOL = 6  # extra px tolerance (image space) for selecting a roi
+LIVE_DETECT_INTERVAL = 0.2  # dust doesn't move -- ~5Hz is plenty, and keeps
+                             # the background pass from starving the UI thread
 
 
 class DustInspectorApp:
@@ -282,6 +285,7 @@ class DustInspectorApp:
         self.original = None          # current BGR frame (live or opened)
         self.result_mask = None       # last binary mask (BGR for display)
         self.dust_circles = []        # detected dust blobs, ringed in red
+        self._live_history = deque(maxlen=3)  # last few live passes, for flicker debounce
         self.rois = []                # list of {"cx","cy","r"}
         self.selected_idx = None
 
@@ -623,17 +627,36 @@ class DustInspectorApp:
     def _live_detect_loop(self):
         """Runs on its own thread so a slow detection pass (big window,
         morphology, contours on a full-res frame) never blocks the camera
-        feed or the UI. The result panel just picks up whatever this loop
-        last produced — it may trail the raw video by a frame or two, which
-        is expected and fine for a preview."""
+        feed or the UI.
+
+        Two things were causing the jitter/flicker you saw:
+          1. this loop was re-running back-to-back with only a 30ms sleep,
+             so it competed hard with the main thread for CPU/GIL time --
+             that's what made the feed and ROI-zoom feel laggy. It's now
+             paced to a fixed ~5Hz, which is plenty since dust doesn't move.
+          2. a single noisy frame right at the Z threshold can flip a pixel
+             in and out of "dust" every frame -- that's real sensor noise,
+             not a bug. A blob is now only shown once it's been confirmed
+             in at least 2 of the last 3 passes, which kills that flicker
+             without hiding real, persistent dust.
+        """
+        last_frame_id = None
         while True:
             if self.live_detect.get() and self.original is not None and self.rois:
-                try:
-                    self._run_detection_silent()
-                except Exception:
-                    pass
-                time.sleep(0.03)
+                frame = self.original
+                if frame is not last_frame_id:
+                    last_frame_id = frame
+                    t0 = time.time()
+                    try:
+                        self._run_detection_silent(frame)
+                    except Exception:
+                        pass
+                    elapsed = time.time() - t0
+                    time.sleep(max(0.02, LIVE_DETECT_INTERVAL - elapsed))
+                else:
+                    time.sleep(0.05)
             else:
+                self._live_history.clear()
                 time.sleep(0.1)
 
     # -------------------------------------------------------------- I/O ---
@@ -733,12 +756,33 @@ class DustInspectorApp:
         else:
             self.status.set("Done, but ROI mask was empty.")
 
-    def _run_detection_silent(self):
+    def _run_detection_silent(self, frame=None):
+        if frame is None:
+            frame = self.original
         win, z_thr, min_area, min_circ = self._current_params()
-        binary, circles, _ = run_zscore_detection(
-            self.original, self.rois, win, z_thr, min_area, min_circ)
+        rois_snapshot = [dict(r) for r in self.rois]  # avoid reading mid-drag/mid-resize
+        binary, circles, _ = run_zscore_detection(frame, rois_snapshot, win, z_thr, min_area, min_circ)
         self.result_mask = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-        self.dust_circles = circles
+        self._live_history.append(circles)
+        self.dust_circles = self._stable_circles()
+
+    def _stable_circles(self):
+        """Only show a blob once it's shown up in >=2 of the last (up to 3)
+        live passes at roughly the same spot. Real dust is there every
+        frame and passes easily; a one-off noise blip on a single frame
+        gets dropped instead of flickering on screen."""
+        history = list(self._live_history)
+        if len(history) < 2:
+            return history[-1] if history else []
+        latest = history[-1]
+        confirmed = []
+        for c in latest:
+            for past in history[:-1]:
+                if any(np.hypot(c["cx"] - p["cx"], c["cy"] - p["cy"]) <= max(c["r"], p["r"])
+                       for p in past):
+                    confirmed.append(c)
+                    break
+        return confirmed
 
     def save_detection_settings(self):
         try:
