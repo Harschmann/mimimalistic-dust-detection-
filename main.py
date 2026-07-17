@@ -670,21 +670,15 @@ class DustInspectorApp:
              in at least 2 of the last 3 passes, which kills that flicker
              without hiding real, persistent dust.
         """
-        last_frame_id = None
         while True:
             if self.live_detect.get() and self.original is not None and self.rois:
-                frame = self.original
-                if frame is not last_frame_id:
-                    last_frame_id = frame
-                    t0 = time.time()
-                    try:
-                        self._run_detection_silent(frame)
-                    except Exception:
-                        pass
-                    elapsed = time.time() - t0
-                    time.sleep(max(0.02, LIVE_DETECT_INTERVAL - elapsed))
-                else:
-                    time.sleep(0.05)
+                t0 = time.time()
+                try:
+                    self._run_detection_silent()
+                except Exception:
+                    pass
+                elapsed = time.time() - t0
+                time.sleep(max(0.02, LIVE_DETECT_INTERVAL - elapsed))
             else:
                 self._live_history.clear()
                 time.sleep(0.1)
@@ -1091,8 +1085,8 @@ class DustInspectorApp:
                 label = f"{d['diameter_mm']:.2f}mm"
             else:
                 label = f"{int(round(d['diameter_px']))}px"
-            cv2.putText(disp, label, (cx + r + 8, cy + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+            cv2.putText(disp, label, (cx + r + 10, cy + 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3, cv2.LINE_AA)
         return disp
 
     def _render(self, canvas, bgr, attr):
