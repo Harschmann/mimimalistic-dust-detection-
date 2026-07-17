@@ -66,12 +66,14 @@ WARNING = "#f59e0b"
 # ---------------------------------------------------------------- storage --
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
-IMAGES_DIR = os.path.join(STORAGE_DIR, "images")
+SOURCE_DIR = os.path.join(STORAGE_DIR, "source_images")
 RESULTS_DIR = os.path.join(STORAGE_DIR, "results")
+RESULTS_NG_DIR = os.path.join(RESULTS_DIR, "NG")
+RESULTS_OK_DIR = os.path.join(RESULTS_DIR, "OK")
 ROI_DIR = os.path.join(STORAGE_DIR, "roi_configs")
 SETTINGS_PATH = os.path.join(STORAGE_DIR, "settings.json")
 
-for _d in (STORAGE_DIR, IMAGES_DIR, RESULTS_DIR, ROI_DIR):
+for _d in (STORAGE_DIR, SOURCE_DIR, RESULTS_DIR, RESULTS_NG_DIR, RESULTS_OK_DIR, ROI_DIR):
     os.makedirs(_d, exist_ok=True)
 
 DEFAULT_SETTINGS = {
@@ -83,6 +85,7 @@ DEFAULT_SETTINGS = {
     "gain": 0.0,
     "min_area": 4.0,
     "min_circularity": 0.55,
+    "min_diameter_mm": 0.1,
 }
 
 
@@ -199,7 +202,8 @@ class CameraManager:
 
 
 # ---------------------------------------------------------------- detect ----
-def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity=0.55):
+def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity=0.55,
+                          mm_per_px=None, min_diameter_mm=0.0):
     """Core Z-score math is UNCHANGED: local Z-score via boxFilter mean/std,
     thresholded inside the union of all circular ROI masks.
 
@@ -211,8 +215,14 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
         that's still elongated/thin (residual arc fragments) or too small to
         be a real particle (min_area, min_circularity are tunable in Settings)
 
+    If the app has been calibrated (mm_per_px set via two-point calibration),
+    each surviving blob also gets a real-world diameter_mm, and anything
+    smaller than min_diameter_mm is rejected too. Without calibration this
+    step is skipped (there's no way to convert px -> mm yet).
+
     Returns the cleaned binary mask, one min-enclosing circle per accepted
-    dust blob (used to ring it in red), and summary stats.
+    dust blob (used to ring it in red; each carries diameter_px and,
+    if calibrated, diameter_mm), and summary stats.
     """
     win = window if window % 2 == 1 else window + 1
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -246,7 +256,13 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
             rejected += 1
             continue
         (cx, cy), r = cv2.minEnclosingCircle(c)
-        circles.append({"cx": float(cx), "cy": float(cy), "r": float(max(r, 3.0))})
+        diameter_px = 2.0 * r
+        diameter_mm = diameter_px * mm_per_px if mm_per_px else None
+        if diameter_mm is not None and diameter_mm < min_diameter_mm:
+            rejected += 1
+            continue
+        circles.append({"cx": float(cx), "cy": float(cy), "r": float(max(r, 3.0)),
+                         "diameter_px": float(diameter_px), "diameter_mm": diameter_mm})
         cv2.drawContours(binary, [c], -1, 255, -1)
 
     stats = None
@@ -285,6 +301,7 @@ class DustInspectorApp:
         self.original = None          # current BGR frame (live or opened)
         self.result_mask = None       # last binary mask (BGR for display)
         self.dust_circles = []        # detected dust blobs, ringed in red
+        self._detection_ran = False   # becomes True after the first detection pass
         self._live_history = deque(maxlen=3)  # last few live passes, for flicker debounce
         self.rois = []                # list of {"cx","cy","r"}
         self.selected_idx = None
@@ -437,6 +454,7 @@ class DustInspectorApp:
         self._btn_secondary(row1, "Connect Cam", self.connect_camera, width=110).pack(side="left", padx=8)
         self.live_btn = self._btn_secondary(row1, "Start Live", self.toggle_live, width=100)
         self.live_btn.pack(side="left", padx=8)
+        self._btn_secondary(row1, "Capture", self.capture_photo, width=90).pack(side="left", padx=8)
         ctk.CTkSwitch(row1, text="Freeze", variable=self.freeze, font=self.f_small,
                       progress_color=ACCENT, text_color=TEXT_MUTED).pack(side="left", padx=(16, 8))
         ctk.CTkSwitch(row1, text="Live Detect", variable=self.live_detect, font=self.f_small,
@@ -464,6 +482,12 @@ class DustInspectorApp:
         self._btn_secondary(row2, "Fit", self.fit, width=52).pack(side="right", padx=4)
         self._btn_secondary(row2, "Zoom Out", lambda: self._zoom_btn(0.8), width=80).pack(side="right", padx=4)
         self._btn_secondary(row2, "Zoom In", lambda: self._zoom_btn(1.25), width=80).pack(side="right", padx=(16, 4))
+
+        verdict_card = self._card(p)
+        verdict_card.pack(fill="x", padx=pad, pady=(0, 8))
+        self.verdict_label = ctk.CTkLabel(verdict_card, text="—", font=ctk.CTkFont(size=34, weight="bold"),
+                                           text_color=TEXT_MUTED)
+        self.verdict_label.pack(pady=10)
 
         canvases = ctk.CTkFrame(p, fg_color="transparent")
         canvases.pack(fill="both", expand=True, padx=pad, pady=(4, pad))
@@ -532,20 +556,25 @@ class DustInspectorApp:
         det_card = self._card(p)
         det_card.pack(fill="x", padx=pad, pady=8)
         self._section_header(det_card, "Detection")
-        det_body = ctk.CTkFrame(det_card, fg_color="transparent")
-        det_body.pack(fill="x", padx=18, pady=(6, 18))
+        det_row1 = ctk.CTkFrame(det_card, fg_color="transparent")
+        det_row1.pack(fill="x", padx=18, pady=(6, 8))
         self.window_var = tk.StringVar(value=str(self.settings["window"]))
         self.zthr_var = tk.StringVar(value=str(self.settings["z_thr"]))
         self.radius_var = tk.StringVar(value=str(self.settings["default_radius"]))
+        self._field(det_row1, "Window size", self.window_var, width=80).pack(side="left", padx=(0, 16))
+        self._field(det_row1, "Z threshold", self.zthr_var, width=80).pack(side="left", padx=(0, 16))
+        self._field(det_row1, "Default ROI radius (px)", self.radius_var, width=100).pack(side="left", padx=(0, 16))
+
+        det_row2 = ctk.CTkFrame(det_card, fg_color="transparent")
+        det_row2.pack(fill="x", padx=18, pady=(0, 6))
         self.min_area_var = tk.StringVar(value=str(self.settings["min_area"]))
         self.min_circ_var = tk.StringVar(value=str(self.settings["min_circularity"]))
-        self._field(det_body, "Window size", self.window_var, width=80).pack(side="left", padx=(0, 16))
-        self._field(det_body, "Z threshold", self.zthr_var, width=80).pack(side="left", padx=(0, 16))
-        self._field(det_body, "Default ROI radius (px)", self.radius_var, width=100).pack(side="left", padx=(0, 16))
-        self._field(det_body, "Min blob area (px²)", self.min_area_var, width=90).pack(side="left", padx=(0, 16))
-        self._field(det_body, "Min circularity (0-1)", self.min_circ_var, width=100).pack(side="left", padx=(0, 16))
-        self._btn_primary(det_body, "Save Settings", self.save_detection_settings, width=120).pack(side="left", pady=(18, 0))
-        ctk.CTkLabel(det_card, text="Circularity ~1 = round dust speck. Arcs / thin edge glints score low — raise this to reject them.",
+        self.min_diam_var = tk.StringVar(value=str(self.settings["min_diameter_mm"]))
+        self._field(det_row2, "Min blob area (px²)", self.min_area_var, width=90).pack(side="left", padx=(0, 16))
+        self._field(det_row2, "Min circularity (0-1)", self.min_circ_var, width=100).pack(side="left", padx=(0, 16))
+        self._field(det_row2, "Min dust diameter (mm)", self.min_diam_var, width=100).pack(side="left", padx=(0, 16))
+        self._btn_primary(det_row2, "Save Settings", self.save_detection_settings, width=120).pack(side="left", pady=(18, 0))
+        ctk.CTkLabel(det_card, text="Circularity ~1 = round dust speck (arcs/glints score low). Min diameter needs calibration first — until then it's ignored.",
                      font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 14))
 
         calib_card = self._card(p)
@@ -556,6 +585,7 @@ class DustInspectorApp:
         calib_body = ctk.CTkFrame(calib_card, fg_color="transparent")
         calib_body.pack(fill="x", padx=18, pady=(0, 18))
         self._btn_primary(calib_body, "Start Calibration", self.start_calibration, width=140).pack(side="left", padx=(0, 8))
+        self._btn_secondary(calib_body, "Undo Point", self.undo_calib_point, width=100).pack(side="left", padx=8)
         self._btn_secondary(calib_body, "Reset", self.reset_calibration, width=90).pack(side="left", padx=8)
         ctk.CTkLabel(calib_body, textvariable=self.scale_label_var, font=self.f_small,
                      text_color=TEXT_MUTED).pack(side="left", padx=16)
@@ -674,24 +704,39 @@ class DustInspectorApp:
         self.original = img
         self.result_mask = None
         self.dust_circles = []
+        self._detection_ran = False
         self.mc.delete("all")
         self.fit()
         self.status.set(f"Loaded {os.path.basename(path)}. Add ROI(s) then Run Detection.")
+
+    def capture_photo(self):
+        if self.original is None:
+            self.status.set("Nothing to capture yet.")
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(SOURCE_DIR, f"capture_{ts}.png")
+        cv2.imwrite(path, self.original)
+        self.status.set(f"Captured {os.path.basename(path)} -> source_images/")
 
     def save_result(self):
         if self.original is None:
             self.status.set("Nothing to save yet.")
             return
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        img_path = os.path.join(IMAGES_DIR, f"capture_{ts}.png")
-        cv2.imwrite(img_path, self.original)
+
+        source_disp = self._build_input_disp()  # original + ROI overlay
+        source_path = os.path.join(SOURCE_DIR, f"source_{ts}.png")
+        cv2.imwrite(source_path, source_disp)
+
+        is_ng = bool(self.dust_circles)
+        verdict = "NG" if is_ng else "OK"
+        verdict_dir = RESULTS_NG_DIR if is_ng else RESULTS_OK_DIR
         result_disp = self._build_result_disp()
-        if result_disp is not None:
-            result_path = os.path.join(RESULTS_DIR, f"result_{ts}.png")
-            cv2.imwrite(result_path, result_disp)
-            self.status.set(f"Saved {os.path.basename(img_path)} + {os.path.basename(result_path)}")
-        else:
-            self.status.set(f"Saved {os.path.basename(img_path)}")
+        result_path = os.path.join(verdict_dir, f"{verdict}_{ts}.png")
+        cv2.imwrite(result_path, result_disp)
+
+        self.status.set(
+            f"Saved source_images/{os.path.basename(source_path)} + results/{verdict}/{os.path.basename(result_path)}")
 
     def save_roi_layout(self):
         if not self.rois:
@@ -736,35 +781,45 @@ class DustInspectorApp:
             min_circ = float(self.min_circ_var.get())
         except ValueError:
             min_circ = self.settings["min_circularity"]
-        return win, z_thr, min_area, min_circ
+        try:
+            min_diam = float(self.min_diam_var.get())
+        except ValueError:
+            min_diam = self.settings["min_diameter_mm"]
+        return win, z_thr, min_area, min_circ, min_diam
 
     def run_detection(self):
         if self.original is None or not self.rois:
             self.status.set("Load an image and add at least one ROI first.")
             return
-        win, z_thr, min_area, min_circ = self._current_params()
+        win, z_thr, min_area, min_circ, min_diam = self._current_params()
+        mm_per_px = self.settings.get("scale_mm_per_px")
         binary, circles, stats = run_zscore_detection(
-            self.original, self.rois, win, z_thr, min_area, min_circ)
+            self.original, self.rois, win, z_thr, min_area, min_circ, mm_per_px, min_diam)
         self.result_mask = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
         self.dust_circles = circles
+        self._detection_ran = True
         self._refresh()
         if stats:
             self.status.set(
                 f"Done. z_thr={z_thr}, max_z={stats['max_z']:.2f}, "
                 f"dust_count={stats['dust_count']}, dust_px={stats['dust_px']}, "
-                f"arcs/noise filtered={stats['rejected']}")
+                f"arcs/noise filtered={stats['rejected']}"
+                + ("" if mm_per_px else "  (not calibrated — mm diameter filter inactive)"))
         else:
             self.status.set("Done, but ROI mask was empty.")
 
     def _run_detection_silent(self, frame=None):
         if frame is None:
             frame = self.original
-        win, z_thr, min_area, min_circ = self._current_params()
+        win, z_thr, min_area, min_circ, min_diam = self._current_params()
+        mm_per_px = self.settings.get("scale_mm_per_px")
         rois_snapshot = [dict(r) for r in self.rois]  # avoid reading mid-drag/mid-resize
-        binary, circles, _ = run_zscore_detection(frame, rois_snapshot, win, z_thr, min_area, min_circ)
+        binary, circles, _ = run_zscore_detection(
+            frame, rois_snapshot, win, z_thr, min_area, min_circ, mm_per_px, min_diam)
         self.result_mask = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
         self._live_history.append(circles)
         self.dust_circles = self._stable_circles()
+        self._detection_ran = True
 
     def _stable_circles(self):
         """Only show a blob once it's shown up in >=2 of the last (up to 3)
@@ -791,6 +846,7 @@ class DustInspectorApp:
             self.settings["default_radius"] = int(self.radius_var.get())
             self.settings["min_area"] = float(self.min_area_var.get())
             self.settings["min_circularity"] = float(self.min_circ_var.get())
+            self.settings["min_diameter_mm"] = float(self.min_diam_var.get())
         except ValueError:
             messagebox.showerror("Settings", "Detection fields must be numbers.")
             return
@@ -806,6 +862,14 @@ class DustInspectorApp:
         self.calib_points = []
         self.switch_page("inspect")
         self.status.set("Calibration: click 2 points at a known real-world distance.")
+
+    def undo_calib_point(self):
+        if self.calib_points:
+            self.calib_points.pop()
+            self._refresh()
+            self.status.set(f"Calibration point removed. {len(self.calib_points)} point(s) remain.")
+        else:
+            self.status.set("No calibration points to undo.")
 
     def reset_calibration(self):
         self.settings["scale_mm_per_px"] = None
@@ -1021,7 +1085,14 @@ class DustInspectorApp:
             color = (0, 255, 255) if i == self.selected_idx else (0, 150, 0)
             cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), color, 1)
         for d in self.dust_circles:
-            cv2.circle(disp, (int(d["cx"]), int(d["cy"])), int(round(d["r"])) + 4, (0, 0, 255), 2)
+            cx, cy, r = int(d["cx"]), int(d["cy"]), int(round(d["r"]))
+            cv2.circle(disp, (cx, cy), r + 4, (0, 0, 255), 2)
+            if d.get("diameter_mm") is not None:
+                label = f"{d['diameter_mm']:.2f}mm"
+            else:
+                label = f"{int(round(d['diameter_px']))}px"
+            cv2.putText(disp, label, (cx + r + 8, cy + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
         return disp
 
     def _render(self, canvas, bgr, attr):
@@ -1058,6 +1129,15 @@ class DustInspectorApp:
         pct = self.zoom * 100
         self.zoom_pct_var.set(f"{pct:.0f}%")
         self.zoom_slider.set(max(25, min(pct, 800)))
+        self._update_verdict()
+
+    def _update_verdict(self):
+        if not self._detection_ran:
+            self.verdict_label.configure(text="—", text_color=TEXT_MUTED)
+        elif self.dust_circles:
+            self.verdict_label.configure(text="NG", text_color=DANGER)
+        else:
+            self.verdict_label.configure(text="OK", text_color=SUCCESS)
 
 
 def main():
