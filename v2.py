@@ -323,6 +323,7 @@ class DustInspectorApp:
 
         # shared state
         self.original = None
+        self.using_static_image = False
         self.rois = []                 # active ROI set used by the main window
         self.last_circles = []         # last inspection's accepted dust blobs
         self.inspection_running = False
@@ -475,12 +476,13 @@ class DustInspectorApp:
             self.footer_var.set(f"Camera not connected ({msg}). Use Teaching > Camera to retry, or Open Image for offline testing.")
 
     def _poll_live(self):
-        frame = self.cam.get_frame()
-        if frame is not None:
-            self.original = frame
-            self._render_main_feed()
-            if self.teaching_win is not None and self.teaching_win.winfo_exists():
-                self._render_roi_canvas()
+        if not self.using_static_image:
+            frame = self.cam.get_frame()
+            if frame is not None:
+                self.original = frame
+                self._render_main_feed()
+                if self.teaching_win is not None and self.teaching_win.winfo_exists():
+                    self._render_roi_canvas()
         self.root.after(120, self._poll_live)
 
     # -------------------------------------------------------- ROI layouts --
@@ -778,13 +780,19 @@ class DustInspectorApp:
             filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.tiff *.tif"), ("All", "*.*")])
         if not path:
             return
-        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        try:
+            data = np.fromfile(path, dtype=np.uint8)  # unicode/non-ASCII path safe, unlike cv2.imread directly
+            img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        except Exception:
+            img = None
         if img is None:
-            messagebox.showerror("Open Image", "Could not load image.")
+            messagebox.showerror("Open Image", "Could not load image (unsupported format, corrupt file, or bad path).")
             return
+        self.using_static_image = True  # stop the live feed from overwriting this
         self.original = img
         self.fit_roi_view()
         self._render_main_feed()
+        self.footer_var.set(f"Loaded {os.path.basename(path)} (static — live feed paused). Reconnect camera to resume live view.")
 
     def test_detection_once(self):
         if self.original is None or not self.rois:
@@ -916,6 +924,7 @@ class DustInspectorApp:
         ok, msg = self.cam.connect()
         self.cam_status_var.set(msg)
         if ok:
+            self.using_static_image = False
             self.cam.apply_settings(exposure_us=self.settings.get("exposure_us"), gain=self.settings.get("gain"))
             self.cam.start_live()
             self.footer_var.set("Camera connected — live feed running.")
