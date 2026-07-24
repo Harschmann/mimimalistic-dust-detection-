@@ -408,8 +408,8 @@ class DustInspectorApp:
         # ---- left: feed (read-only) + log ----
         left = ctk.CTkFrame(body, fg_color="transparent")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
-        left.grid_rowconfigure(0, weight=3)
-        left.grid_rowconfigure(1, weight=1)
+        left.grid_rowconfigure(0, weight=1)
+        left.grid_rowconfigure(1, weight=0)
         left.grid_columnconfigure(0, weight=1)
 
         feed_card = self._card(left)
@@ -420,8 +420,9 @@ class DustInspectorApp:
         self.feed_canvas.pack(fill="both", expand=True, padx=3, pady=3)
         self.feed_canvas.bind("<Configure>", lambda e: self._render_main_feed())
 
-        log_card = self._card(left)
+        log_card = self._card(left, height=190)
         log_card.grid(row=1, column=0, sticky="nsew")
+        log_card.grid_propagate(False)
         ctk.CTkLabel(log_card, text="Inspection Log", font=self.f_section, text_color=TEXT).pack(anchor="w", padx=16, pady=(12, 6))
         self.log_box = ctk.CTkTextbox(log_card, fg_color=BG_CANVAS, text_color=TEXT_MUTED,
                                        font=ctk.CTkFont(family="Courier New", size=12), corner_radius=8, wrap="none")
@@ -553,8 +554,9 @@ class DustInspectorApp:
             return
         barcode = self.barcode_var.get().strip()
         if not barcode:
-            messagebox.showwarning("No Barcode", "Scan the module's barcode before starting.")
-            return
+            # no scanner hooked up (e.g. testing on a laptop) -- don't block,
+            # just tag the record so it's still traceable in the log
+            barcode = f"MANUAL-{datetime.now().strftime('%H%M%S')}"
 
         self.inspection_running = True
         self.start_btn.configure(text="Running…", state="disabled", fg_color=BG_CARD_ALT)
