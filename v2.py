@@ -348,6 +348,17 @@ class DustInspectorApp:
         self._t_drag_start = (0, 0)
         self._t_last = (0, 0)
 
+        # main operator feed view-only zoom/pan state (no ROI editing here)
+        self.m_zoom = 1.0
+        self.m_base_scale = 1.0
+        self.m_view_x = 0.0
+        self.m_view_y = 0.0
+        self._m_dragging = False
+        self._m_drag_start = (0, 0)
+        self._m_last = (0, 0)
+        self._main_fitted = False
+        self._main_fitted_shape = None
+
         self.current_view = "operator"
         self.main_photo = None
         self.roi_photo = None
@@ -463,7 +474,7 @@ class DustInspectorApp:
         body.grid_columnconfigure(1, weight=1)
         body.grid_rowconfigure(0, weight=1)
 
-        # ---- left: feed (read-only) + log ----
+        # ---- left: feed (view-only zoom/pan) + log ----
         left = ctk.CTkFrame(body, fg_color="transparent")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
         left.grid_rowconfigure(0, weight=1)
@@ -472,11 +483,21 @@ class DustInspectorApp:
 
         feed_card = self._card(left)
         feed_card.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+        feed_head = ctk.CTkFrame(feed_card, fg_color="transparent")
+        feed_head.pack(fill="x", padx=14, pady=(12, 0))
+        ctk.CTkLabel(feed_head, text="Live Feed  •  wheel = zoom  •  drag = pan (view only)",
+                     font=self.f_small, text_color=TEXT_MUTED).pack(side="left")
+        self._btn_secondary(feed_head, "Fit", self._fit_main_view, width=60).pack(side="right")
         wrap = ctk.CTkFrame(feed_card, fg_color=BG_CANVAS, corner_radius=10)
         wrap.pack(fill="both", expand=True, padx=14, pady=14)
         self.feed_canvas = tk.Canvas(wrap, bg=BG_CANVAS, highlightthickness=0)
         self.feed_canvas.pack(fill="both", expand=True, padx=3, pady=3)
         self.feed_canvas.bind("<Configure>", lambda e: self._render_main_feed())
+        self.feed_canvas.bind("<MouseWheel>", self.on_main_wheel)
+        self.feed_canvas.bind("<Button-4>", self.on_main_wheel)
+        self.feed_canvas.bind("<Button-5>", self.on_main_wheel)
+        self.feed_canvas.bind("<ButtonPress-1>", self.on_main_press)
+        self.feed_canvas.bind("<B1-Motion>", self.on_main_drag)
 
         log_card = self._card(left, height=190)
         log_card.grid(row=1, column=0, sticky="nsew")
@@ -569,7 +590,7 @@ class DustInspectorApp:
         save_settings(self.settings)
         self._render_main_feed()
 
-    # -------------------------------------------------- main feed (READ-ONLY)
+    # -------------------------------------------------- main feed (view-only)
     def _build_main_overlay(self):
         disp = self.original.copy()
         for roi in self.rois:
@@ -581,21 +602,90 @@ class DustInspectorApp:
             cv2.putText(disp, label, (cx + r + 10, cy + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3, cv2.LINE_AA)
         return disp
 
+    def _canvas_wh_main(self):
+        w, h = self.feed_canvas.winfo_width(), self.feed_canvas.winfo_height()
+        if w < 10 or h < 10:
+            return CANVAS_W, CANVAS_H
+        return w, h
+
+    def _fit_main_view(self):
+        if self.original is None:
+            return
+        cw, ch = self._canvas_wh_main()
+        h, w = self.original.shape[:2]
+        self.m_base_scale = min(cw / w, ch / h)
+        self.m_zoom = 1.0
+        s = self.m_base_scale
+        self.m_view_x = (cw - w * s) / 2
+        self.m_view_y = (ch - h * s) / 2
+        self._main_fitted = True
+        self._main_fitted_shape = (h, w)
+        self._render_main_feed()
+
+    def _apply_main_zoom(self, factor, cx, cy):
+        if self.original is None:
+            return
+        s_old = self.m_base_scale * self.m_zoom
+        ix = (cx - self.m_view_x) / s_old
+        iy = (cy - self.m_view_y) / s_old
+        self.m_zoom = max(0.2, min(self.m_zoom * factor, 20.0))
+        s_new = self.m_base_scale * self.m_zoom
+        self.m_view_x = cx - ix * s_new
+        self.m_view_y = cy - iy * s_new
+        self._render_main_feed()
+
+    def on_main_wheel(self, event):
+        if self.original is None:
+            return
+        direction = 1 if (getattr(event, "delta", 0) > 0 or getattr(event, "num", None) == 4) else -1
+        factor = 1.2 if direction > 0 else 1 / 1.2
+        self._apply_main_zoom(factor, event.x, event.y)
+
+    def on_main_press(self, event):
+        self._m_drag_start = (event.x, event.y)
+        self._m_last = (event.x, event.y)
+        self._m_dragging = False
+
+    def on_main_drag(self, event):
+        if self.original is None:
+            return
+        if not self._m_dragging:
+            if abs(event.x - self._m_drag_start[0]) + abs(event.y - self._m_drag_start[1]) > 4:
+                self._m_dragging = True
+        if not self._m_dragging:
+            return
+        self.m_view_x += event.x - self._m_last[0]
+        self.m_view_y += event.y - self._m_last[1]
+        self._m_last = (event.x, event.y)
+        self._render_main_feed()
+
     def _render_main_feed(self):
         self.feed_canvas.delete("all")
         if self.original is None:
             return
+        shape = self.original.shape[:2]
+        if not self._main_fitted or self._main_fitted_shape != shape:
+            self._fit_main_view()
+            return
         disp = self._build_main_overlay()
-        cw = self.feed_canvas.winfo_width() or CANVAS_W
-        ch = self.feed_canvas.winfo_height() or CANVAS_H
-        h, w = disp.shape[:2]
-        scale = min(cw / w, ch / h)
-        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-        resized = cv2.resize(disp, (nw, nh), interpolation=cv2.INTER_AREA)
+        cw, ch = self._canvas_wh_main()
+        H, W = disp.shape[:2]
+        s = self.m_base_scale * self.m_zoom
+        vx, vy = self.m_view_x, self.m_view_y
+        l = max(0, int(-vx / s))
+        t = max(0, int(-vy / s))
+        r = min(W, int((cw - vx) / s) + 1)
+        b = min(H, int((ch - vy) / s) + 1)
+        if r <= l or b <= t:
+            return
+        crop = disp[t:b, l:r]
+        cwid = max(1, int((r - l) * s))
+        chei = max(1, int((b - t) * s))
+        interp = cv2.INTER_CUBIC if self.m_zoom > 1.0 else cv2.INTER_AREA
+        resized = cv2.resize(crop, (cwid, chei), interpolation=interp)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-        ox, oy = (cw - nw) // 2, (ch - nh) // 2
-        self.feed_canvas.create_image(ox, oy, anchor="nw", image=photo)
+        self.feed_canvas.create_image(vx + l * s, vy + t * s, anchor="nw", image=photo)
         self.main_photo = photo
 
     # ------------------------------------------------------------- logging
@@ -966,10 +1056,11 @@ class DustInspectorApp:
             messagebox.showwarning("Camera", msg)
 
     # ---------------------------------------------- ROI canvas interaction
-    # (Only the Teaching window's ROI canvas is interactive — the main
-    # operator feed is pure display, which is what fixes the ROI "slip":
-    # a stray click on the operator's feed used to be able to add, move,
-    # or resize an ROI without anyone noticing.)
+    # (Only the Teaching window's ROI canvas can add/move/resize ROIs — the
+    # main operator feed only zooms/pans for viewing, it never touches ROI
+    # data, which is what fixes the ROI "slip": a stray click on the
+    # operator's feed used to be able to add, move, or resize an ROI
+    # without anyone noticing.)
     def _canvas_wh(self):
         w, h = self.roi_canvas.winfo_width(), self.roi_canvas.winfo_height()
         if w < 10 or h < 10:
