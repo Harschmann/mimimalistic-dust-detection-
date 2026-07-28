@@ -33,6 +33,7 @@ Run:  python dust_inspector_app.py
 """
 
 import os
+import sys
 import csv
 import json
 import time
@@ -73,7 +74,13 @@ DANGER_HOVER = "#dc2626"
 WARNING = "#f59e0b"
 
 # ---------------------------------------------------------------- storage --
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    # Running as a PyInstaller .exe: __file__ would point at a temp
+    # extraction folder that's wiped after the app closes. Use the actual
+    # exe's folder instead so storage/ persists across runs.
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STORAGE_DIR = os.path.join(BASE_DIR, "storage")
 SOURCE_DIR = os.path.join(STORAGE_DIR, "source_images")
 RESULTS_DIR = os.path.join(STORAGE_DIR, "results")
@@ -88,7 +95,7 @@ for _d in (STORAGE_DIR, SOURCE_DIR, RESULTS_DIR, RESULTS_NG_DIR, RESULTS_OK_DIR,
     os.makedirs(_d, exist_ok=True)
 
 DEFAULT_SETTINGS = {
-    "window": 31,
+    "window": 100,
     "z_thr": 3.0,
     "default_radius": 100,
     "scale_mm_per_px": None,
@@ -341,7 +348,7 @@ class DustInspectorApp:
         self._t_drag_start = (0, 0)
         self._t_last = (0, 0)
 
-        self.teaching_win = None
+        self.current_view = "operator"
         self.main_photo = None
         self.roi_photo = None
 
@@ -394,14 +401,64 @@ class DustInspectorApp:
         outer = ctk.CTkFrame(self.root, fg_color=BG, corner_radius=0)
         outer.pack(fill="both", expand=True)
 
-        # ---- header ----
+        # ---- header (persistent across both views) ----
         header = ctk.CTkFrame(outer, fg_color="transparent")
         header.pack(fill="x", padx=20, pady=(16, 6))
-        ctk.CTkLabel(header, text="Camera Dust Inspection", font=self.f_title, text_color=TEXT).pack(anchor="w")
-        ctk.CTkLabel(header, textvariable=self.model_line_var, font=self.f_subtitle, text_color=TEXT_MUTED).pack(anchor="w", pady=(2, 0))
+        title_box = ctk.CTkFrame(header, fg_color="transparent")
+        title_box.pack(side="left")
+        ctk.CTkLabel(title_box, text="Camera Dust Inspection", font=self.f_title, text_color=TEXT).pack(anchor="w")
+        ctk.CTkLabel(title_box, textvariable=self.model_line_var, font=self.f_subtitle, text_color=TEXT_MUTED).pack(anchor="w", pady=(2, 0))
 
-        body = ctk.CTkFrame(outer, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=20, pady=(4, 6))
+        nav = ctk.CTkFrame(header, fg_color=BG_CARD_ALT, corner_radius=10)
+        nav.pack(side="right", pady=(8, 0))
+        self.nav_operator_btn = ctk.CTkButton(nav, text="Operator", width=110, corner_radius=8, font=self.f_body,
+                                               command=self.show_operator_page)
+        self.nav_operator_btn.pack(side="left", padx=4, pady=4)
+        self.nav_teaching_btn = ctk.CTkButton(nav, text="Teaching", width=110, corner_radius=8, font=self.f_body,
+                                               command=self.show_teaching_page)
+        self.nav_teaching_btn.pack(side="left", padx=4, pady=4)
+
+        # ---- swappable content area: same window, no separate popup ----
+        container = ctk.CTkFrame(outer, fg_color=BG, corner_radius=0)
+        container.pack(fill="both", expand=True, padx=20, pady=(4, 6))
+        container.grid_rowconfigure(0, weight=1)
+        container.grid_columnconfigure(0, weight=1)
+
+        self.page_operator = ctk.CTkFrame(container, fg_color=BG, corner_radius=0)
+        self.page_teaching = ctk.CTkFrame(container, fg_color=BG, corner_radius=0)
+        self.page_operator.grid(row=0, column=0, sticky="nsew")
+        self.page_teaching.grid(row=0, column=0, sticky="nsew")
+
+        self._build_operator_page(self.page_operator)
+        self._build_teaching_page(self.page_teaching)
+
+        # ---- footer ----
+        footer = ctk.CTkFrame(outer, fg_color=BG_SIDEBAR, height=30, corner_radius=0)
+        footer.pack(fill="x", side="bottom")
+        footer.pack_propagate(False)
+        ctk.CTkLabel(footer, textvariable=self.footer_var, font=self.f_small, text_color=TEXT_MUTED).pack(side="left", padx=16)
+
+        self.show_operator_page()
+
+    def show_operator_page(self):
+        self.current_view = "operator"
+        self.page_operator.tkraise()
+        self.nav_operator_btn.configure(fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#ffffff")
+        self.nav_teaching_btn.configure(fg_color="transparent", hover_color=BORDER, text_color=TEXT_MUTED)
+        self._render_main_feed()
+        self.barcode_entry.focus_set()
+
+    def show_teaching_page(self):
+        self.current_view = "teaching"
+        self.page_teaching.tkraise()
+        self.nav_teaching_btn.configure(fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#ffffff")
+        self.nav_operator_btn.configure(fg_color="transparent", hover_color=BORDER, text_color=TEXT_MUTED)
+        self.fit_roi_view()
+        self._render_roi_canvas()
+
+    def _build_operator_page(self, page):
+        body = ctk.CTkFrame(page, fg_color="transparent")
+        body.pack(fill="both", expand=True)
         body.grid_columnconfigure(0, weight=3)
         body.grid_columnconfigure(1, weight=1)
         body.grid_rowconfigure(0, weight=1)
@@ -430,7 +487,7 @@ class DustInspectorApp:
         self.log_box.pack(fill="both", expand=True, padx=16, pady=(0, 16))
         self.log_box.configure(state="disabled")
 
-        # ---- right: status / barcode / teaching / start-stop ----
+        # ---- right: status / barcode / start ----
         right = ctk.CTkFrame(body, fg_color="transparent")
         right.grid(row=0, column=1, sticky="nsew")
 
@@ -447,19 +504,27 @@ class DustInspectorApp:
                                            corner_radius=8, fg_color=BG_CARD_ALT, border_color=BORDER, text_color=TEXT)
         self.barcode_entry.pack(fill="x", padx=18, pady=(0, 16))
 
-        self._btn_secondary(right, "Teaching", self.open_teaching_window, width=200, height=44).pack(fill="x", pady=(0, 10))
-
         self.start_btn = self._btn_primary(right, "Start Inspection", self.start_inspection, width=200, height=52,
                                             font=ctk.CTkFont(size=15, weight="bold"))
         self.start_btn.pack(fill="x", pady=(0, 10))
 
-        # ---- footer ----
-        footer = ctk.CTkFrame(outer, fg_color=BG_SIDEBAR, height=30, corner_radius=0)
-        footer.pack(fill="x", side="bottom")
-        footer.pack_propagate(False)
-        ctk.CTkLabel(footer, textvariable=self.footer_var, font=self.f_small, text_color=TEXT_MUTED).pack(side="left", padx=16)
+    def _build_teaching_page(self, page):
+        top = ctk.CTkFrame(page, fg_color="transparent")
+        top.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(top, text="Teaching / Setup", font=self.f_title, text_color=TEXT).pack(side="left")
+        self._btn_secondary(top, "Back to Operator", self.show_operator_page, width=160).pack(side="right")
 
-        self.barcode_entry.focus_set()
+        tabs = ctk.CTkTabview(page)
+        tabs.pack(fill="both", expand=True)
+        tab_model = tabs.add("Model & Line")
+        tab_roi = tabs.add("ROI & Calibration")
+        tab_detect = tabs.add("Detection")
+        tab_cam = tabs.add("Camera")
+
+        self._build_model_tab(tab_model)
+        self._build_roi_tab(tab_roi)
+        self._build_detection_tab(tab_detect)
+        self._build_camera_tab(tab_cam)
 
     def _set_status(self, text, color):
         self.status_var.set(text)
@@ -481,7 +546,7 @@ class DustInspectorApp:
             if frame is not None:
                 self.original = frame
                 self._render_main_feed()
-                if self.teaching_win is not None and self.teaching_win.winfo_exists():
+                if self.current_view == "teaching":
                     self._render_roi_canvas()
         self.root.after(120, self._poll_live)
 
@@ -610,38 +675,7 @@ class DustInspectorApp:
         self.barcode_var.set("")
         self.barcode_entry.focus_set()
 
-    # =================================================== TEACHING WINDOW ==
-    def open_teaching_window(self):
-        if self.teaching_win is not None and self.teaching_win.winfo_exists():
-            self.teaching_win.lift()
-            self.teaching_win.focus_force()
-            return
-        win = ctk.CTkToplevel(self.root)
-        self.teaching_win = win
-        win.title("Teaching / Setup")
-        win.geometry("1300x820")
-        win.configure(fg_color=BG)
-        win.protocol("WM_DELETE_WINDOW", lambda: self._close_teaching(win))
-
-        tabs = ctk.CTkTabview(win)
-        tabs.pack(fill="both", expand=True, padx=10, pady=10)
-        tab_model = tabs.add("Model & Line")
-        tab_roi = tabs.add("ROI & Calibration")
-        tab_detect = tabs.add("Detection")
-        tab_cam = tabs.add("Camera")
-
-        self._build_model_tab(tab_model)
-        self._build_roi_tab(tab_roi)
-        self._build_detection_tab(tab_detect)
-        self._build_camera_tab(tab_cam)
-
-        self.fit_roi_view()
-
-    def _close_teaching(self, win):
-        win.destroy()
-        self.teaching_win = None
-        self._render_main_feed()
-        self.barcode_entry.focus_set()
+    # =================================================== TEACHING PAGE ==
 
     # ---- Model & Line -------------------------------------------------
     def _build_model_tab(self, tab):
@@ -754,7 +788,7 @@ class DustInspectorApp:
         if not self.rois:
             messagebox.showinfo("Save Layout", "No ROIs to save.")
             return
-        name = simpledialog.askstring("Save ROI Layout", "Layout name (e.g. model_A56_main):", parent=self.teaching_win)
+        name = simpledialog.askstring("Save ROI Layout", "Layout name (e.g. model_A56_main):", parent=self.root)
         if not name:
             return
         with open(os.path.join(ROI_DIR, f"{name}.json"), "w") as f:
@@ -837,7 +871,7 @@ class DustInspectorApp:
         if pixel_dist < 1:
             self.footer_var.set("Calibration points too close together, try again.")
             return
-        dist_mm = simpledialog.askfloat("Calibration", "Real-world distance between the two points (mm):", parent=self.teaching_win)
+        dist_mm = simpledialog.askfloat("Calibration", "Real-world distance between the two points (mm):", parent=self.root)
         if not dist_mm:
             self._render_roi_canvas()
             return
@@ -1072,7 +1106,7 @@ class DustInspectorApp:
         return disp
 
     def _render_roi_canvas(self):
-        if self.teaching_win is None or not self.teaching_win.winfo_exists():
+        if self.current_view != "teaching":
             return
         self.roi_canvas.delete("all")
         if self.original is None:
