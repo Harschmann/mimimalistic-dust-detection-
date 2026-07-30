@@ -105,7 +105,9 @@ DEFAULT_SETTINGS = {
     "min_area": 4.0,
     "min_circularity": 0.55,
     "min_diameter_mm": 0.1,
-    "max_thread_length_px": 60.0,
+    "max_thread_length_px": 100000.0,
+    "min_straightness": 0.90,
+    "max_thin_width_px": 8.0,
     "model_name": "",
     "line_name": "",
     "active_roi_name": None,
@@ -136,7 +138,7 @@ def log_to_csv(row):
         w = csv.writer(f)
         if is_new:
             w.writerow(["timestamp", "model", "line", "barcode", "verdict",
-                        "dust_count", "thread_count", "max_diameter_mm"])
+                        "dust_count", "thread_count", "glue_count", "max_diameter_mm"])
         w.writerow(row)
 
 
@@ -245,37 +247,102 @@ def norm_u8(arr):
     return (a * 255).astype(np.uint8)
 
 
+KIND_COLORS = {
+    "dust": (0, 0, 255),      # red
+    "thread": (0, 200, 255),  # amber
+    "glue": (255, 0, 255),    # magenta
+}
+
+
+def kind_color(kind):
+    return KIND_COLORS.get(kind, (0, 0, 255))
+
+
+def contour_width(c):
+    """Estimated max local thickness of a blob, via distance transform:
+    for a stroke of width w, the distance-to-nearest-edge at its centreline
+    is ~w/2, so 2x the max distance-transform value approximates the
+    thickest point along the blob. This is what actually separates a real
+    thread/fibre (genuinely thin, a few px across its whole length) from
+    glue residue (spreads out from the module edge, often several px to
+    tens of px wide even where it's elongated or arc-shaped)."""
+    x, y, w, h = cv2.boundingRect(c)
+    pad = 2
+    mask = np.zeros((h + 2 * pad, w + 2 * pad), dtype=np.uint8)
+    shifted = c - [x - pad, y - pad]
+    cv2.drawContours(mask, [shifted], -1, 255, -1)
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    return float(2.0 * dist.max())
+
+
+def contour_straightness(c):
+    """chord length (straight-line distance between the two farthest points
+    on the contour's convex hull) divided by path length (perimeter / 2,
+    which approximates the "unrolled" length of a thin elongated blob,
+    since both long edges contribute to the perimeter).
+
+    straightness ~ 1.0  -> nearly straight or gently bent (a real thread,
+                            even a long one, still runs close to straight)
+    straightness << 1.0 -> genuinely curved, sweeping a real arc (the
+                            signature of a lens/coating reflection)
+
+    This is what actually tells a thread apart from a lens-ring artifact --
+    LENGTH does not, since a real fibre can be short or long and still be a
+    thread; a lens reflection is characterized by its curvature, not by
+    how long it happens to be."""
+    hull = cv2.convexHull(c).reshape(-1, 2)
+    if len(hull) < 2:
+        return 1.0
+    max_dist = 0.0
+    for i in range(len(hull)):
+        for j in range(i + 1, len(hull)):
+            d = float(np.hypot(hull[i][0] - hull[j][0], hull[i][1] - hull[j][1]))
+            if d > max_dist:
+                max_dist = d
+    chord = max_dist
+    path = cv2.arcLength(c, True) / 2.0
+    if path < 1e-3:
+        return 1.0
+    return min(1.0, chord / path)
+
+
 def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity=0.55,
-                          mm_per_px=None, min_diameter_mm=0.0, max_thread_length_px=60.0,
-                          return_steps=False):
+                          mm_per_px=None, min_diameter_mm=0.0, max_thread_length_px=100000.0,
+                          min_straightness=0.90, max_thin_width_px=8.0, return_steps=False):
     """Local Z-score via boxFilter mean/std, thresholded inside the union of
     all circular ROI masks, cleaned up with a morphological opening.
 
-    Shape classification (this is the part that changed): every surviving
-    blob used to be judged by circularity alone, which meant a genuine
-    thread/fibre (thin, non-round) was rejected exactly like a lens/coating
-    reflection arc (also thin, non-round) -- both look identical to a
-    circularity gate. The only thing that actually tells them apart
-    physically is LENGTH: a stray fibre on a small module surface is a
-    short fragment, while a lens-reflection sweeps a long, large-radius
-    curve across a much bigger span of the frame. So now:
+    Shape classification -- every non-round survivor is now split into
+    THREAD, GLUE, or ARC, since all three can be thin/elongated and would
+    look identical to circularity alone:
 
-      - circularity >= min_circularity                    -> "dust"   (accepted)
-      - circularity <  min_circularity AND short           -> "thread" (accepted)
-      - circularity <  min_circularity AND long/sweeping   -> "arc"    (rejected)
+      - circularity >= min_circularity                          -> "dust"
+      - circularity <  min_circularity AND WIDE (>= max_thin_width_px)
+                                                                  -> "glue"
+            (glue residue spreads out from the module edge -- it's often
+            elongated or even arc-shaped near the border, but it's thick,
+            not a fine line, so width is what identifies it, regardless
+            of curvature)
+      - circularity <  min_circularity AND thin AND straight     -> "thread"
+            (a real fibre stays close to straight even if it's long)
+      - circularity <  min_circularity AND thin AND curved       -> "arc"
+            (rejected -- the signature of a lens/coating reflection:
+            genuinely thin AND genuinely curved)
 
-    "long" is measured via the blob's minAreaRect long side against
-    max_thread_length_px (tunable in Settings).
+    Width is estimated via contour_width() (distance-transform based);
+    straightness via contour_straightness() (chord length / path length).
+    max_thread_length_px is kept only as an optional extra safety cap
+    (default effectively disabled).
 
     If the app has been calibrated (mm_per_px set via two-point calibration),
     each surviving blob also gets a real-world diameter_mm, and anything
     smaller than min_diameter_mm is rejected too.
 
     Returns (binary_mask, circles, stats) as before -- each item in
-    `circles` now also carries a "kind" of "dust" or "thread". If
+    `circles` now carries a "kind" of "dust", "thread", or "glue", plus
+    "width_px" and (for thin blobs) "straightness" for tuning. If
     return_steps=True, also returns a `steps` dict with every intermediate
-    array (grayscale, local mean/std, Z-score, raw threshold, opened mask,
-    and the rejected arc contours) for the pipeline-steps debug viewer.
+    array for the pipeline-steps debug viewer.
     """
     win = window if window % 2 == 1 else window + 1
     gray_u8 = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -312,13 +379,19 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
         (cx, cy), r = cv2.minEnclosingCircle(c)
         (rw, rh) = cv2.minAreaRect(c)[1]
         length_px = max(rw, rh)
+        width_px = contour_width(c)
+        straightness = None
 
         if circularity >= min_circularity:
             kind = "dust"
-        elif length_px <= max_thread_length_px:
-            kind = "thread"
+        elif width_px >= max_thin_width_px:
+            kind = "glue"
         else:
-            kind = "arc"
+            straightness = contour_straightness(c)
+            if straightness >= min_straightness and length_px <= max_thread_length_px:
+                kind = "thread"
+            else:
+                kind = "arc"
 
         if kind == "arc":
             rejected_arc_contours.append(c)
@@ -332,18 +405,20 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
 
         circles.append({"kind": kind, "cx": float(cx), "cy": float(cy), "r": float(max(r, 3.0)),
                          "diameter_px": float(diameter_px), "diameter_mm": diameter_mm,
-                         "length_px": float(length_px), "circularity": float(circularity)})
+                         "length_px": float(length_px), "circularity": float(circularity),
+                         "width_px": float(width_px), "straightness": straightness})
         cv2.drawContours(binary, [c], -1, 255, -1)
 
     dust_count = sum(1 for d in circles if d["kind"] == "dust")
     thread_count = sum(1 for d in circles if d["kind"] == "thread")
+    glue_count = sum(1 for d in circles if d["kind"] == "glue")
 
     stats = None
     if mask.any():
         roi_z = zscore[mask == 255]
         stats = {"max_z": float(roi_z.max()), "mean_z": float(roi_z.mean()),
                  "dust_px": int((binary == 255).sum()), "dust_count": dust_count,
-                 "thread_count": thread_count, "rejected": rejected_noise,
+                 "thread_count": thread_count, "glue_count": glue_count, "rejected": rejected_noise,
                  "rejected_arcs": len(rejected_arc_contours)}
 
     if not return_steps:
@@ -383,7 +458,7 @@ def build_pipeline_step_images(rois, circles, steps, params):
     for c in steps["rejected_arc_contours"]:
         cv2.drawContours(classify_vis, [c], -1, (0, 0, 255), 2)  # red = rejected arc
     for d in circles:
-        color = (0, 255, 0) if d["kind"] == "dust" else (0, 200, 255)
+        color = (0, 255, 0) if d["kind"] == "dust" else kind_color(d["kind"])
         cv2.circle(classify_vis, (int(d["cx"]), int(d["cy"])), int(d["r"]) + 4, color, 2)
 
     final = bgr.copy()
@@ -391,7 +466,7 @@ def build_pipeline_step_images(rois, circles, steps, params):
         cv2.circle(final, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), (0, 255, 0), 1)
     for d in circles:
         cx, cy, r = int(d["cx"]), int(d["cy"]), int(round(d["r"]))
-        color = (0, 0, 255) if d["kind"] == "dust" else (0, 200, 255)
+        color = kind_color(d["kind"])
         cv2.circle(final, (cx, cy), r + 4, color, 2)
         size = f"{d['diameter_mm']:.2f}mm" if d.get("diameter_mm") is not None else f"{d['diameter_px']:.0f}px"
         cv2.putText(final, f"{d['kind']}:{size}", (cx + r + 8, cy + 6),
@@ -406,7 +481,8 @@ def build_pipeline_step_images(rois, circles, steps, params):
     zthr = params.get("z_thr", 3.0)
     min_area = params.get("min_area", 4.0)
     min_circ = params.get("min_circularity", 0.55)
-    max_thread = params.get("max_thread_length_px", 60.0)
+    min_straight = params.get("min_straightness", 0.90)
+    max_thin_w = params.get("max_thin_width_px", 8.0)
 
     return [
         ("1. Raw Image", bgr, "Input frame (live feed capture or Open Image)."),
@@ -423,9 +499,10 @@ def build_pipeline_step_images(rois, circles, steps, params):
          f"Z \u2265 {zthr} AND inside ROI \u2192 raw candidates (yellow)."),
         ("8. Morphological Opening", opened_overlay,
          "3\u00d73 elliptical kernel, MORPH_OPEN -- kills 1-2px sensor noise."),
-        ("9. Dust / Thread / Arc", classify_vis,
-         f"circularity\u2265{min_circ} \u2192 dust (green). Elongated & \u2264{max_thread:.0f}px \u2192 "
-         f"thread (yellow). Elongated & longer \u2192 arc, rejected (red)."),
+        ("9. Dust / Thread / Glue / Arc", classify_vis,
+         f"circularity\u2265{min_circ} \u2192 dust (green). Width\u2265{max_thin_w:.0f}px \u2192 glue "
+         f"(magenta, even if arc-shaped). Thin & straightness\u2265{min_straight} \u2192 thread (amber, "
+         f"even if long). Thin & curved \u2192 arc, rejected (red)."),
         ("10. Verdict", final,
          "Accepted blobs ringed + labeled by kind. Any defect \u2192 FAIL, logged."),
     ]
@@ -728,7 +805,7 @@ class DustInspectorApp:
             cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), (0, 255, 0), 2)
         for d in self.last_circles:
             cx, cy, r = int(d["cx"]), int(d["cy"]), int(round(d["r"]))
-            color = (0, 0, 255) if d.get("kind", "dust") == "dust" else (0, 200, 255)
+            color = kind_color(d.get("kind", "dust"))
             cv2.circle(disp, (cx, cy), r + 4, color, 2)
             size = f"{d['diameter_mm']:.2f}mm" if d.get("diameter_mm") is not None else f"{int(round(d['diameter_px']))}px"
             label = f"{d.get('kind', 'dust')}:{size}"
@@ -822,16 +899,16 @@ class DustInspectorApp:
         self.main_photo = photo
 
     # ------------------------------------------------------------- logging
-    def _append_log(self, model, line, barcode, verdict, dust_count, thread_count, max_dia):
+    def _append_log(self, model, line, barcode, verdict, dust_count, thread_count, glue_count, max_dia):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         dia_txt = f"{max_dia:.2f}mm" if max_dia is not None else "-"
         line_txt = (f"[{ts}] {barcode:<16} | Model:{model or '-':<10} Line:{line or '-':<8} | "
-                    f"{verdict:<4} | dust={dust_count} thread={thread_count} max={dia_txt}\n")
+                    f"{verdict:<4} | dust={dust_count} thread={thread_count} glue={glue_count} max={dia_txt}\n")
         self.log_box.configure(state="normal")
         self.log_box.insert("end", line_txt)
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
-        log_to_csv([ts, model, line, barcode, verdict, dust_count, thread_count,
+        log_to_csv([ts, model, line, barcode, verdict, dust_count, thread_count, glue_count,
                     f"{max_dia:.3f}" if max_dia is not None else ""])
 
     # -------------------------------------------------------- inspection --
@@ -862,7 +939,8 @@ class DustInspectorApp:
         try:
             binary, circles, stats = run_zscore_detection(
                 frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
-                s.get("scale_mm_per_px"), s["min_diameter_mm"], s.get("max_thread_length_px", 60.0))
+                s.get("scale_mm_per_px"), s["min_diameter_mm"], s.get("max_thread_length_px", 100000.0),
+                s.get("min_straightness", 0.90), s.get("max_thin_width_px", 8.0))
         except Exception as e:
             circles, stats = [], None
         self.root.after(0, lambda: self._finish_inspection(frame, rois_snapshot, circles, barcode))
@@ -884,14 +962,17 @@ class DustInspectorApp:
         max_dia = None
         dust_count = 0
         thread_count = 0
+        glue_count = 0
         for d in circles:
             cx, cy, r = int(d["cx"]), int(d["cy"]), int(round(d["r"]))
             kind = d.get("kind", "dust")
             if kind == "dust":
                 dust_count += 1
-            else:
+            elif kind == "thread":
                 thread_count += 1
-            color = (0, 0, 255) if kind == "dust" else (0, 200, 255)
+            else:
+                glue_count += 1
+            color = kind_color(kind)
             cv2.circle(result_disp, (cx, cy), r + 4, color, 2)
             size = f"{d['diameter_mm']:.2f}mm" if d.get("diameter_mm") is not None else f"{int(round(d['diameter_px']))}px"
             cv2.putText(result_disp, f"{kind}:{size}", (cx + r + 10, cy + 8),
@@ -902,7 +983,7 @@ class DustInspectorApp:
         cv2.imwrite(os.path.join(verdict_dir, f"{'NG' if is_ng else 'OK'}_{ts}_{barcode}.png"), result_disp)
 
         self._append_log(self.settings.get("model_name"), self.settings.get("line_name"),
-                          barcode, verdict, dust_count, thread_count, max_dia)
+                          barcode, verdict, dust_count, thread_count, glue_count, max_dia)
 
         self._render_main_feed()
         self.inspection_running = False
@@ -1073,8 +1154,8 @@ class DustInspectorApp:
         s = self.settings
         binary, circles, stats, steps = run_zscore_detection(
             self.original, self.rois, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
-            s.get("scale_mm_per_px"), s["min_diameter_mm"], s.get("max_thread_length_px", 60.0),
-            return_steps=True)
+            s.get("scale_mm_per_px"), s["min_diameter_mm"], s.get("max_thread_length_px", 100000.0),
+            s.get("min_straightness", 0.90), s.get("max_thin_width_px", 8.0), return_steps=True)
         self.last_circles = circles
         self.last_steps = steps
         self.last_rois_used = [dict(r) for r in self.rois]
@@ -1082,7 +1163,7 @@ class DustInspectorApp:
         self._render_main_feed()
         self.view_steps_btn.configure(state="normal")
         if stats:
-            msg = (f"dust={stats['dust_count']} thread={stats['thread_count']} "
+            msg = (f"dust={stats['dust_count']} thread={stats['thread_count']} glue={stats['glue_count']} "
                    f"max_z={stats['max_z']:.2f} rejected_noise={stats['rejected']} "
                    f"rejected_arcs={stats['rejected_arcs']}")
         else:
@@ -1096,7 +1177,8 @@ class DustInspectorApp:
             return
         params = dict(window=self.settings["window"], z_thr=self.settings["z_thr"],
                       min_area=self.settings["min_area"], min_circularity=self.settings["min_circularity"],
-                      max_thread_length_px=self.settings.get("max_thread_length_px", 60.0))
+                      min_straightness=self.settings.get("min_straightness", 0.90),
+                      max_thin_width_px=self.settings.get("max_thin_width_px", 8.0))
         step_images = build_pipeline_step_images(self.last_rois_used, self.last_circles, self.last_steps, params)
 
         win = ctk.CTkToplevel(self.root)
@@ -1244,12 +1326,21 @@ class DustInspectorApp:
         self._field(row2, "Min dust diameter (mm)", self.min_diam_var, width=100).pack(side="left", padx=(0, 16))
 
         row3 = ctk.CTkFrame(card, fg_color="transparent")
-        row3.pack(fill="x", padx=18, pady=(0, 18))
-        self.max_thread_var = tk.StringVar(value=str(self.settings.get("max_thread_length_px", 60.0)))
-        self._field(row3, "Max thread length (px)", self.max_thread_var, width=100).pack(side="left", padx=(0, 16))
-        ctk.CTkLabel(row3, text="Elongated blobs \u2264 this length are kept as THREAD; longer/sweeping ones are\nrejected as lens/reflection ARCS.",
+        row3.pack(fill="x", padx=18, pady=(0, 8))
+        self.min_straight_var = tk.StringVar(value=str(self.settings.get("min_straightness", 0.90)))
+        self._field(row3, "Min straightness (0-1)", self.min_straight_var, width=100).pack(side="left", padx=(0, 16))
+        ctk.CTkLabel(row3, text="Elongated blobs at or above this straightness (chord/path length) are kept as\n"
+                                 "THREAD, however long -- lower straightness (genuinely curved) is rejected as ARC.",
                      font=self.f_small, text_color=TEXT_MUTED, justify="left").pack(side="left", padx=(0, 16))
-        self._btn_primary(row3, "Save", self._save_detection_settings, width=100).pack(side="left")
+
+        row4 = ctk.CTkFrame(card, fg_color="transparent")
+        row4.pack(fill="x", padx=18, pady=(0, 18))
+        self.max_thin_width_var = tk.StringVar(value=str(self.settings.get("max_thin_width_px", 8.0)))
+        self._field(row4, "Max thin width (px)", self.max_thin_width_var, width=100).pack(side="left", padx=(0, 16))
+        ctk.CTkLabel(row4, text="Elongated blobs at or above this width are GLUE (spread out from the edge,\n"
+                                 "even if arc-shaped). Only blobs thinner than this are checked for THREAD/ARC.",
+                     font=self.f_small, text_color=TEXT_MUTED, justify="left").pack(side="left", padx=(0, 16))
+        self._btn_primary(row4, "Save", self._save_detection_settings, width=100).pack(side="left")
 
     def _save_detection_settings(self):
         try:
@@ -1259,7 +1350,8 @@ class DustInspectorApp:
             self.settings["min_area"] = float(self.min_area_var.get())
             self.settings["min_circularity"] = float(self.min_circ_var.get())
             self.settings["min_diameter_mm"] = float(self.min_diam_var.get())
-            self.settings["max_thread_length_px"] = float(self.max_thread_var.get())
+            self.settings["min_straightness"] = float(self.min_straight_var.get())
+            self.settings["max_thin_width_px"] = float(self.max_thin_width_var.get())
         except ValueError:
             messagebox.showerror("Settings", "All fields must be numbers.")
             return
@@ -1445,7 +1537,7 @@ class DustInspectorApp:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         for d in self.last_circles:
             cx, cy, r = int(d["cx"]), int(d["cy"]), int(round(d["r"]))
-            color = (0, 0, 255) if d.get("kind", "dust") == "dust" else (0, 200, 255)
+            color = kind_color(d.get("kind", "dust"))
             cv2.circle(disp, (cx, cy), r + 4, color, 2)
         for (px, py) in self.calib_points:
             cv2.circle(disp, (int(px), int(py)), 6, (255, 0, 255), -1)
