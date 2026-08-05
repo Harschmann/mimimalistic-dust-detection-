@@ -84,6 +84,14 @@ DANGER_HOVER = "#dc2626"
 WARNING = "#f59e0b"
 VINYL_COLOR = "#a855f7"  # distinct from PASS/FAIL/IN-PROGRESS so it reads as its own state
 
+# BGR (for cv2 drawing, not the hex UI colors above) per defect type
+BLOB_COLOR_BGR = {
+    "dust": (0, 0, 255),      # red
+    "thread": (0, 165, 255),  # amber
+    "glue": (255, 0, 255),    # magenta
+}
+VINYL_COLOR_BGR = (245, 85, 168)  # pink-purple, kept distinct from glue's magenta
+
 # ---------------------------------------------------------------- storage --
 if getattr(sys, "frozen", False):
     # Running as a PyInstaller .exe: __file__ would point at a temp
@@ -117,6 +125,9 @@ DEFAULT_SETTINGS = {
     "min_area": 4.0,
     "min_circularity": 0.55,
     "min_diameter_mm": 0.1,
+    "min_aspect_ratio": 3.0,
+    "max_thin_width_px": 8.0,
+    "min_straightness": 0.55,
     "vinyl_tolerance_px": 15.0,
     "vinyl_strength_thr": 6.0,
     "model_name": "",
@@ -248,26 +259,36 @@ class CameraManager:
 
 # ---------------------------------------------------------------- detect ----
 def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity=0.55,
-                          mm_per_px=None, min_diameter_mm=0.0):
+                          mm_per_px=None, min_diameter_mm=0.0,
+                          min_aspect_ratio=3.0, max_thin_width_px=8.0, min_straightness=0.55):
     """Core Z-score math is UNCHANGED: local Z-score via boxFilter mean/std,
     thresholded inside the union of all circular ROI masks.
 
-    On top of that, two shape-based filters clean up the raw threshold:
-      - a small morphological opening erases anything thinner than a few px
-        (this kills thin curved edge artifacts / arcs and 1-2px sensor noise,
-        since a real dust speck is round and a few px wide, an arc isn't)
-      - a circularity + min-area check on the surviving blobs drops anything
-        that's still elongated/thin (residual arc fragments) or too small to
-        be a real particle (min_area, min_circularity are tunable in Settings)
+    Every surviving connected blob is then classified by SHAPE:
+      - round + big + circular enough                         -> DUST
+      - elongated (aspect >= min_aspect_ratio), thin (short
+        side <= max_thin_width_px), and fills its own straight
+        bounding rectangle well (extent >= min_straightness)   -> THREAD/FIBER
+      - elongated + thin but does NOT fill its bounding
+        rectangle well (a curved arc bows out and leaves empty
+        corners in a straight box)                             -> ARC, rejected
+      - elongated + wide (short side > max_thin_width_px)      -> GLUE
+
+    This replaces an earlier blanket morphological opening: that approach
+    reliably erased thin curved lens/reflection arcs, but it also erased
+    genuinely thin thread/fiber contamination, since both are "thin"
+    shapes geometrically -- one blunt filter can't tell them apart. A
+    light CLOSING is used instead (bridges tiny gaps in a thin shape's
+    raw mask, never erases it), and the arc/thread split happens by shape
+    afterwards, on the whole contour.
 
     If the app has been calibrated (mm_per_px set via two-point calibration),
-    each surviving blob also gets a real-world diameter_mm, and anything
-    smaller than min_diameter_mm is rejected too. Without calibration this
-    step is skipped (there's no way to convert px -> mm yet).
+    sizes are also reported in mm; anything under min_diameter_mm (for dust)
+    is rejected too. Without calibration this step is skipped.
 
-    Returns the cleaned binary mask, one min-enclosing circle per accepted
-    dust blob (used to ring it in red; each carries diameter_px and,
-    if calibrated, diameter_mm), and summary stats.
+    Returns the cleaned binary mask, a list of classified blob dicts (each
+    with "type": "dust"/"thread"/"glue", position, size, and a ready-to-draw
+    "label" string), and summary stats.
     """
     win = window if window % 2 == 1 else window + 1
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -283,40 +304,73 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
 
     raw = np.where((zscore >= z_thr) & (mask == 255), 255, 0).astype(np.uint8)
 
+    # a light closing bridges tiny 1px gaps in a thin thread's raw mask --
+    # unlike an opening, this cannot erase a genuinely thin shape
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    opened = cv2.morphologyEx(raw, cv2.MORPH_OPEN, kernel)
+    cleaned = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, kernel)
 
-    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    circles = []
-    binary = np.zeros_like(opened)
+    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blobs = []
+    binary = np.zeros_like(cleaned)
     rejected = 0
+
     for c in contours:
         area = cv2.contourArea(c)
         if area < min_area:
             rejected += 1
             continue
+
         perimeter = cv2.arcLength(c, True)
         circularity = (4 * np.pi * area / (perimeter * perimeter)) if perimeter > 0 else 0.0
-        if circularity < min_circularity:
-            rejected += 1
+
+        if circularity >= min_circularity:
+            (cx, cy), r = cv2.minEnclosingCircle(c)
+            diameter_px = 2.0 * r
+            diameter_mm = diameter_px * mm_per_px if mm_per_px else None
+            if diameter_mm is not None and diameter_mm < min_diameter_mm:
+                rejected += 1
+                continue
+            label = f"{diameter_mm:.2f}mm" if diameter_mm is not None else f"{diameter_px:.0f}px"
+            blobs.append({"type": "dust", "cx": float(cx), "cy": float(cy), "r": float(max(r, 3.0)),
+                          "diameter_px": float(diameter_px), "diameter_mm": diameter_mm, "label": label})
+            cv2.drawContours(binary, [c], -1, 255, -1)
             continue
-        (cx, cy), r = cv2.minEnclosingCircle(c)
-        diameter_px = 2.0 * r
-        diameter_mm = diameter_px * mm_per_px if mm_per_px else None
-        if diameter_mm is not None and diameter_mm < min_diameter_mm:
+
+        # not round -- is it a real elongated shape at all?
+        (rcx, rcy), (rw, rh), _angle = cv2.minAreaRect(c)
+        long_side, short_side = max(rw, rh), max(min(rw, rh), 1e-6)
+        aspect = long_side / short_side
+        if aspect < min_aspect_ratio:
             rejected += 1
-            continue
-        circles.append({"cx": float(cx), "cy": float(cy), "r": float(max(r, 3.0)),
-                         "diameter_px": float(diameter_px), "diameter_mm": diameter_mm})
+            continue  # neither round nor elongated enough -- ambiguous, drop
+
+        extent = area / (rw * rh + 1e-6)  # how much of its own straight bounding box it fills
+        r_draw = max(long_side / 2.0, 3.0)
+
+        if short_side <= max_thin_width_px:
+            if extent < min_straightness:
+                rejected += 1
+                continue  # thin + curved -- an arc (lens/coating reflection), not real contamination
+            btype = "thread"
+        else:
+            btype = "glue"
+
+        if mm_per_px:
+            label = f"{btype} {long_side * mm_per_px:.2f}x{short_side * mm_per_px:.2f}mm"
+        else:
+            label = f"{btype} {long_side:.0f}x{short_side:.0f}px"
+
+        blobs.append({"type": btype, "cx": float(rcx), "cy": float(rcy), "r": float(r_draw),
+                      "length_px": float(long_side), "width_px": float(short_side), "label": label})
         cv2.drawContours(binary, [c], -1, 255, -1)
 
     stats = None
     if mask.any():
         roi_z = zscore[mask == 255]
         stats = {"max_z": float(roi_z.max()), "mean_z": float(roi_z.mean()),
-                 "dust_px": int((binary == 255).sum()), "dust_count": len(circles),
+                 "dust_px": int((binary == 255).sum()), "dust_count": len(blobs),
                  "rejected": rejected}
-    return binary, circles, stats
+    return binary, blobs, stats
 
 
 def detect_vinyl_presence(gray, cx, cy, roi_radius, tolerance_px=15.0, strength_ratio_thr=6.0):
@@ -422,7 +476,7 @@ class DustInspectorApp:
         self.original = None
         self.using_static_image = False
         self.rois = []                 # active ROI set used by the main window
-        self.last_circles = []         # last inspection's accepted dust blobs
+        self.last_blobs = []           # last inspection's accepted blobs: dust/thread/glue
         self.last_vinyl_hits = []      # last inspection's vinyl-flagged ROIs: [{"roi":..., "info":...}]
         self.inspection_running = False
 
@@ -619,6 +673,13 @@ class DustInspectorApp:
         self.status_label = ctk.CTkLabel(status_card, textvariable=self.status_var, font=self.f_status, text_color=TEXT_MUTED)
         self.status_label.pack(anchor="w", padx=18, pady=(2, 16))
 
+        findings_card = self._card(right)
+        findings_card.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(findings_card, text="FINDINGS", font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(14, 4))
+        self.findings_var = tk.StringVar(value="--")
+        ctk.CTkLabel(findings_card, textvariable=self.findings_var, font=self.f_body, text_color=TEXT,
+                     justify="left", anchor="w").pack(anchor="w", padx=18, pady=(0, 14))
+
         barcode_card = self._card(right)
         barcode_card.pack(fill="x", pady=(0, 10))
         ctk.CTkLabel(barcode_card, text="BARCODE", font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(14, 4))
@@ -658,8 +719,9 @@ class DustInspectorApp:
         """Wipes the last inspection's red/purple overlays off the feed --
         for when the camera's been unplugged/moved and stale markings are
         stuck on the last frame it ever delivered."""
-        self.last_circles = []
+        self.last_blobs = []
         self.last_vinyl_hits = []
+        self.findings_var.set("--")
         self._set_status("IDLE", TEXT_MUTED)
         self._render_main_feed()
         if self.current_view == "teaching":
@@ -708,17 +770,17 @@ class DustInspectorApp:
     def _build_main_overlay(self):
         disp = self.original.copy()
         for roi in self.rois:
-            color = (245, 85, 168) if self._is_vinyl_flagged(roi) else (0, 255, 0)
+            color = VINYL_COLOR_BGR if self._is_vinyl_flagged(roi) else (0, 255, 0)
             cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), color, 2)
-        for d in self.last_circles:
-            cx, cy, r = int(d["cx"]), int(d["cy"]), int(round(d["r"]))
-            cv2.circle(disp, (cx, cy), r + 4, (0, 0, 255), 2)
-            label = f"{d['diameter_mm']:.2f}mm" if d.get("diameter_mm") is not None else f"{int(round(d['diameter_px']))}px"
-            cv2.putText(disp, label, (cx + r + 10, cy + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3, cv2.LINE_AA)
+        for b in self.last_blobs:
+            cx, cy, r = int(b["cx"]), int(b["cy"]), int(round(b["r"]))
+            color = BLOB_COLOR_BGR.get(b["type"], (0, 0, 255))
+            cv2.circle(disp, (cx, cy), r + 4, color, 2)
+            cv2.putText(disp, b["label"], (cx + r + 10, cy + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3, cv2.LINE_AA)
         for h in self.last_vinyl_hits:
             roi = h["roi"]
             cx, cy, r = int(roi["cx"]), int(roi["cy"]), int(roi["r"])
-            cv2.putText(disp, "VINYL?", (cx - r, cy - r - 12), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (245, 85, 168), 3, cv2.LINE_AA)
+            cv2.putText(disp, "VINYL?", (cx - r, cy - r - 12), cv2.FONT_HERSHEY_SIMPLEX, 1.0, VINYL_COLOR_BGR, 3, cv2.LINE_AA)
         return disp
 
     def _canvas_wh_main(self):
@@ -854,7 +916,7 @@ class DustInspectorApp:
         """Runs entirely off the main/UI thread (started as a daemon Thread
         by start_inspection). Inside it, the two independent detectors run
         on their OWN parallel threads:
-          - dust/contamination: run_zscore_detection
+          - contamination classification (dust/thread/glue): run_zscore_detection
           - vinyl/lamination film: detect_vinyl_presence, once per ROI
         Neither needs the other's output, so running them concurrently cuts
         total detection time to roughly max(dust_time, vinyl_time) rather
@@ -867,12 +929,13 @@ class DustInspectorApp:
 
         def run_dust():
             try:
-                _binary, circles, _stats = run_zscore_detection(
+                _binary, blobs, _stats = run_zscore_detection(
                     frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
-                    s.get("scale_mm_per_px"), s["min_diameter_mm"])
-                result["dust"] = circles
+                    s.get("scale_mm_per_px"), s["min_diameter_mm"],
+                    s["min_aspect_ratio"], s["max_thin_width_px"], s["min_straightness"])
+                result["blobs"] = blobs
             except Exception:
-                result["dust"] = []
+                result["blobs"] = []
 
         def run_vinyl():
             try:
@@ -896,22 +959,22 @@ class DustInspectorApp:
         t_dust.join()
         t_vinyl.join()
 
-        circles = result.get("dust", [])
+        blobs = result.get("blobs", [])
         vinyl_hits = result.get("vinyl", [])
 
-        verdict, max_dia, log_args = self._save_inspection_artifacts(frame, rois_snapshot, circles, vinyl_hits, barcode)
+        verdict, log_args = self._save_inspection_artifacts(frame, rois_snapshot, blobs, vinyl_hits, barcode)
 
-        self.root.after(0, lambda: self._finish_inspection(circles, vinyl_hits, verdict, log_args))
+        self.root.after(0, lambda: self._finish_inspection(blobs, vinyl_hits, verdict, log_args))
 
-    def _save_inspection_artifacts(self, frame, rois_snapshot, circles, vinyl_hits, barcode):
+    def _save_inspection_artifacts(self, frame, rois_snapshot, blobs, vinyl_hits, barcode):
         """All cv2/file work for one inspection cycle -- still on the
-        background thread, no Tkinter here. Returns (verdict, max_dia,
-        log_args) -- log_args gets handed to _append_log_line on the main
-        thread since that call touches a Tkinter widget."""
+        background thread, no Tkinter here. Returns (verdict, log_args) --
+        log_args gets handed to _append_log_line on the main thread since
+        that call touches a Tkinter widget."""
         is_vinyl = bool(vinyl_hits)
-        is_ng = bool(circles)
+        is_ng = bool(blobs)
         if is_vinyl:
-            verdict = "VINYL"   # checked first: dust results under a film aren't trustworthy anyway
+            verdict = "VINYL"   # recorded specifically for the log/filename; the on-screen badge just says FAIL
         elif is_ng:
             verdict = "FAIL"
         else:
@@ -921,41 +984,59 @@ class DustInspectorApp:
         flagged_ids = {id(h["roi"]) for h in vinyl_hits}
         source_disp = frame.copy()
         for roi in rois_snapshot:
-            color = (245, 85, 168) if id(roi) in flagged_ids else (0, 255, 0)
+            color = VINYL_COLOR_BGR if id(roi) in flagged_ids else (0, 255, 0)
             cv2.circle(source_disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), color, 2)
         cv2.imwrite(os.path.join(SOURCE_DIR, f"source_{ts}_{barcode}.png"), source_disp)
 
         result_disp = source_disp.copy()
         max_dia = None
-        for d in circles:
-            cx, cy, r = int(d["cx"]), int(d["cy"]), int(round(d["r"]))
-            cv2.circle(result_disp, (cx, cy), r + 4, (0, 0, 255), 2)
-            label = f"{d['diameter_mm']:.2f}mm" if d.get("diameter_mm") is not None else f"{int(round(d['diameter_px']))}px"
-            cv2.putText(result_disp, label, (cx + r + 10, cy + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3, cv2.LINE_AA)
-            if d.get("diameter_mm") is not None:
-                max_dia = max(max_dia or 0.0, d["diameter_mm"])
+        for b in blobs:
+            cx, cy, r = int(b["cx"]), int(b["cy"]), int(round(b["r"]))
+            color = BLOB_COLOR_BGR.get(b["type"], (0, 0, 255))
+            cv2.circle(result_disp, (cx, cy), r + 4, color, 2)
+            cv2.putText(result_disp, b["label"], (cx + r + 10, cy + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3, cv2.LINE_AA)
+            if b["type"] == "dust" and b.get("diameter_mm") is not None:
+                max_dia = max(max_dia or 0.0, b["diameter_mm"])
         for h in vinyl_hits:
             roi = h["roi"]
             cx, cy, r = int(roi["cx"]), int(roi["cy"]), int(roi["r"])
-            cv2.putText(result_disp, "VINYL?", (cx - r, cy - r - 12), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (245, 85, 168), 3, cv2.LINE_AA)
+            cv2.putText(result_disp, "VINYL?", (cx - r, cy - r - 12), cv2.FONT_HERSHEY_SIMPLEX, 1.0, VINYL_COLOR_BGR, 3, cv2.LINE_AA)
 
         verdict_dir = {"VINYL": RESULTS_VINYL_DIR, "FAIL": RESULTS_NG_DIR, "PASS": RESULTS_OK_DIR}[verdict]
         cv2.imwrite(os.path.join(verdict_dir, f"{verdict}_{ts}_{barcode}.png"), result_disp)
 
         model, line = self.settings.get("model_name"), self.settings.get("line_name")
-        log_ts = self._write_log_csv(model, line, barcode, verdict, len(circles), max_dia)
-        log_args = (log_ts, barcode, model, line, verdict, len(circles), max_dia)
-        return verdict, max_dia, log_args
+        log_ts = self._write_log_csv(model, line, barcode, verdict, len(blobs), max_dia)
+        log_args = (log_ts, barcode, model, line, verdict, len(blobs), max_dia)
+        return verdict, log_args
 
-    def _finish_inspection(self, circles, vinyl_hits, verdict, log_args):
+    def _build_findings_text(self, blobs, vinyl_hits):
+        if not blobs and not vinyl_hits:
+            return "No issues found"
+        lines = []
+        if vinyl_hits:
+            lines.append(f"- Vinyl film suspected ({len(vinyl_hits)} ROI)")
+        counts = {}
+        for b in blobs:
+            counts[b["type"]] = counts.get(b["type"], 0) + 1
+        for t in ("dust", "thread", "glue"):
+            if counts.get(t):
+                lines.append(f"- {counts[t]}x {t}")
+        return "\n".join(lines)
+
+    def _finish_inspection(self, blobs, vinyl_hits, verdict, log_args):
         """Main-thread-only: updates widgets, including the log line (the
-        CSV row was already written on the background thread). All the
-        heavy lifting already happened before this was scheduled."""
-        self.last_circles = circles
+        CSV row was already written on the background thread). The main
+        status badge only ever shows PASS/FAIL -- the specific defect
+        type(s) show in the Findings panel instead, and still get recorded
+        precisely in the log/filenames via `verdict`."""
+        self.last_blobs = blobs
         self.last_vinyl_hits = vinyl_hits
         self._append_log_line(*log_args)
-        color = {"VINYL": VINYL_COLOR, "FAIL": DANGER, "PASS": SUCCESS}[verdict]
-        self._set_status(verdict, color)
+        display_verdict = "PASS" if verdict == "PASS" else "FAIL"
+        color = SUCCESS if display_verdict == "PASS" else DANGER
+        self._set_status(display_verdict, color)
+        self.findings_var.set(self._build_findings_text(blobs, vinyl_hits))
         self._render_main_feed()
         self.inspection_running = False
         self.start_btn.configure(text="Start Inspection", state="normal", fg_color=ACCENT)
@@ -1120,28 +1201,34 @@ class DustInspectorApp:
             messagebox.showinfo("Test Detection", "Need an image and at least one ROI.")
             return
         s = self.settings
-        binary, circles, stats = run_zscore_detection(
+        binary, blobs, stats = run_zscore_detection(
             self.original, self.rois, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
-            s.get("scale_mm_per_px"), s["min_diameter_mm"])
+            s.get("scale_mm_per_px"), s["min_diameter_mm"],
+            s["min_aspect_ratio"], s["max_thin_width_px"], s["min_straightness"])
         gray = cv2.cvtColor(self.original, cv2.COLOR_BGR2GRAY)
         vinyl_hits = []
-        for roi in self.rois:
+        vinyl_per_roi = []  # every ROI's number, not just the ones that passed -- for diagnosing why some ROIs don't flag
+        for i, roi in enumerate(self.rois):
             detected, info = detect_vinyl_presence(
                 gray, roi["cx"], roi["cy"], roi["r"],
                 tolerance_px=s.get("vinyl_tolerance_px", 15.0),
                 strength_ratio_thr=s.get("vinyl_strength_thr", 6.0))
+            vinyl_per_roi.append((i + 1, detected, info.get("strength_ratio", 0.0)))
             if detected:
                 vinyl_hits.append({"roi": roi, "info": info})
-        self.last_circles = circles
+        self.last_blobs = blobs
         self.last_vinyl_hits = vinyl_hits
         self._render_roi_canvas()
         self._render_main_feed()
-        msg = f"dust_count={len(circles)}"
+
+        counts = {}
+        for b in blobs:
+            counts[b["type"]] = counts.get(b["type"], 0) + 1
+        msg = ", ".join(f"{n} {t}" for t, n in counts.items()) or "no defects"
         if stats:
-            msg += f", max_z={stats['max_z']:.2f}, rejected={stats['rejected']}"
-        if vinyl_hits:
-            best = max(vinyl_hits, key=lambda h: h["info"]["strength_ratio"])
-            msg += f", VINYL SUSPECTED (strength={best['info']['strength_ratio']:.1f})"
+            msg += f" | max_z={stats['max_z']:.2f} rejected={stats['rejected']}"
+        vinyl_txt = " ".join(f"ROI{n}={s_:.1f}{'*' if d else ''}" for n, d, s_ in vinyl_per_roi)
+        msg += f" | vinyl: {vinyl_txt}"
         self.footer_var.set("Test detection: " + msg)
 
     # ---- calibration (shares ROI canvas clicks) -----------------------
@@ -1205,12 +1292,25 @@ class DustInspectorApp:
         self._field(row2, "Min dust diameter (mm)", self.min_diam_var, width=100).pack(side="left", padx=(0, 16))
 
         row3 = ctk.CTkFrame(card, fg_color="transparent")
-        row3.pack(fill="x", padx=18, pady=(0, 18))
+        row3.pack(fill="x", padx=18, pady=(0, 8))
+        self.min_aspect_var = tk.StringVar(value=str(self.settings["min_aspect_ratio"]))
+        self.max_thin_var = tk.StringVar(value=str(self.settings["max_thin_width_px"]))
+        self.min_straight_var = tk.StringVar(value=str(self.settings["min_straightness"]))
+        self._field(row3, "Min elongation ratio", self.min_aspect_var, width=90).pack(side="left", padx=(0, 16))
+        self._field(row3, "Max thread/arc width (px)", self.max_thin_var, width=110).pack(side="left", padx=(0, 16))
+        self._field(row3, "Min straightness (0-1)", self.min_straight_var, width=100).pack(side="left", padx=(0, 16))
+        ctk.CTkLabel(card, text="Elongated + thin + straight = thread (kept). Elongated + thin + curved = arc (rejected, lens/coating reflection). Elongated + wide = glue.",
+                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 8))
+
+        row4 = ctk.CTkFrame(card, fg_color="transparent")
+        row4.pack(fill="x", padx=18, pady=(0, 18))
         self.vinyl_tol_var = tk.StringVar(value=str(self.settings["vinyl_tolerance_px"]))
         self.vinyl_thr_var = tk.StringVar(value=str(self.settings["vinyl_strength_thr"]))
-        self._field(row3, "Vinyl tolerance (px)", self.vinyl_tol_var, width=90).pack(side="left", padx=(0, 16))
-        self._field(row3, "Vinyl strength threshold", self.vinyl_thr_var, width=100).pack(side="left", padx=(0, 16))
-        self._btn_primary(row3, "Save", self._save_detection_settings, width=100).pack(side="left", pady=(18, 0))
+        self._field(row4, "Vinyl tolerance (px)", self.vinyl_tol_var, width=90).pack(side="left", padx=(0, 16))
+        self._field(row4, "Vinyl strength threshold", self.vinyl_thr_var, width=100).pack(side="left", padx=(0, 16))
+        self._btn_primary(row4, "Save", self._save_detection_settings, width=100).pack(side="left", pady=(18, 0))
+        ctk.CTkLabel(card, text="Vinyl tolerance is a band on BOTH sides of the ROI radius (radius +/- this many px), not a one-directional offset -- typical value is 10-30px; large values risk picking up unrelated edges.",
+                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 14))
 
     def _save_detection_settings(self):
         try:
@@ -1220,6 +1320,9 @@ class DustInspectorApp:
             self.settings["min_area"] = float(self.min_area_var.get())
             self.settings["min_circularity"] = float(self.min_circ_var.get())
             self.settings["min_diameter_mm"] = float(self.min_diam_var.get())
+            self.settings["min_aspect_ratio"] = float(self.min_aspect_var.get())
+            self.settings["max_thin_width_px"] = float(self.max_thin_var.get())
+            self.settings["min_straightness"] = float(self.min_straight_var.get())
             self.settings["vinyl_tolerance_px"] = float(self.vinyl_tol_var.get())
             self.settings["vinyl_strength_thr"] = float(self.vinyl_thr_var.get())
         except ValueError:
@@ -1403,16 +1506,16 @@ class DustInspectorApp:
             if i == self.selected_idx:
                 color = (0, 255, 255)
             elif self._is_vinyl_flagged(roi):
-                color = (245, 85, 168)
+                color = VINYL_COLOR_BGR
             else:
                 color = (0, 255, 0)
             cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), color, 2)
             cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), 5, color, -1)
             cv2.putText(disp, str(i + 1), (int(roi["cx"]) + 10, int(roi["cy"]) - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-        for d in self.last_circles:
-            cx, cy, r = int(d["cx"]), int(d["cy"]), int(round(d["r"]))
-            cv2.circle(disp, (cx, cy), r + 4, (0, 0, 255), 2)
+        for b in self.last_blobs:
+            cx, cy, r = int(b["cx"]), int(b["cy"]), int(round(b["r"]))
+            cv2.circle(disp, (cx, cy), r + 4, BLOB_COLOR_BGR.get(b["type"], (0, 0, 255)), 2)
         for (px, py) in self.calib_points:
             cv2.circle(disp, (int(px), int(py)), 6, (255, 0, 255), -1)
         if len(self.calib_points) == 2:
