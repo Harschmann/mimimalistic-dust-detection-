@@ -1,9 +1,9 @@
 """
-Dust Inspector — Operator-facing camera dust-detection app
+Dust Inspector -- Operator-facing camera dust-detection app
 ------------------------------------------------------------
 Single-file desktop app, restructured into TWO windows:
 
-  1. Main Operator Window — what the line operator actually uses:
+  1. Main Operator Window -- what the line operator actually uses:
      title, Model/Line readout, a big live feed (view-only zoom/pan, no
      ROI editing), a scrolling result log, and a right-hand panel with
      Status / Barcode / Teaching / Start Inspection / Clear Markings.
@@ -15,7 +15,7 @@ Single-file desktop app, restructured into TWO windows:
      software can catch; worth a physical check on the fixture too.)
 
   2. Teaching Window (opened via the "Teaching" button, same app window,
-     no separate popup) — technician-only setup: Model & Line naming,
+     no separate popup) -- technician-only setup: Model & Line naming,
      ROI placement + two-point calibration (the one interactive canvas
      in the whole app), detection parameters, and camera settings.
 
@@ -155,7 +155,7 @@ def log_to_csv(row):
 # ---------------------------------------------------------- camera manager --
 class CameraManager:
     """Thin wrapper around a Basler camera via pypylon, with a background
-    grab thread. Safe to use even when pypylon / hardware is unavailable —
+    grab thread. Safe to use even when pypylon / hardware is unavailable --
     callers should check .connected before relying on live frames."""
 
     def __init__(self):
@@ -457,7 +457,7 @@ class DustInspectorApp:
         self.model_line_var = tk.StringVar(value=self._model_line_text())
         self.status_var = tk.StringVar(value="IDLE")
         self.barcode_var = tk.StringVar(value="")
-        self.footer_var = tk.StringVar(value="Starting up…")
+        self.footer_var = tk.StringVar(value="Starting up...")
 
         self._build_main_ui()
         self._load_active_roi_layout()
@@ -466,8 +466,8 @@ class DustInspectorApp:
 
     # ------------------------------------------------------------- utils --
     def _model_line_text(self):
-        m = self.settings.get("model_name") or "—"
-        l = self.settings.get("line_name") or "—"
+        m = self.settings.get("model_name") or "--"
+        l = self.settings.get("line_name") or "--"
         return f"Model: {m}      Line: {l}"
 
     def _scale_text(self):
@@ -586,7 +586,7 @@ class DustInspectorApp:
         feed_card.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
         feed_head = ctk.CTkFrame(feed_card, fg_color="transparent")
         feed_head.pack(fill="x", padx=14, pady=(12, 0))
-        ctk.CTkLabel(feed_head, text="Live Feed  •  wheel = zoom  •  drag = pan (view only)",
+        ctk.CTkLabel(feed_head, text="Live Feed  -  wheel = zoom  -  drag = pan (view only)",
                      font=self.f_small, text_color=TEXT_MUTED).pack(side="left")
         self._btn_secondary(feed_head, "Fit", self._fit_main_view, width=60).pack(side="right")
         wrap = ctk.CTkFrame(feed_card, fg_color=BG_CANVAS, corner_radius=10)
@@ -671,7 +671,7 @@ class DustInspectorApp:
         if ok:
             self.cam.apply_settings(exposure_us=self.settings.get("exposure_us"), gain=self.settings.get("gain"))
             self.cam.start_live()
-            self.footer_var.set("Camera connected — live feed running.")
+            self.footer_var.set("Camera connected -- live feed running.")
         else:
             self.footer_var.set(f"Camera not connected ({msg}). Use Teaching > Camera to retry, or Open Image for offline testing.")
 
@@ -844,7 +844,7 @@ class DustInspectorApp:
             barcode = f"MANUAL-{datetime.now().strftime('%H%M%S')}"
 
         self.inspection_running = True
-        self.start_btn.configure(text="Running…", state="disabled", fg_color=BG_CARD_ALT)
+        self.start_btn.configure(text="Running...", state="disabled", fg_color=BG_CARD_ALT)
         self._set_status("IN PROGRESS", WARNING)
         frame = self.original.copy()
         rois_snapshot = [dict(r) for r in self.rois]
@@ -1002,7 +1002,7 @@ class DustInspectorApp:
 
         canvas_card = self._card(body)
         canvas_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        ctk.CTkLabel(canvas_card, text="click = add/select ROI  •  drag = pan  •  wheel = zoom  •  scroll on selected ROI = resize",
+        ctk.CTkLabel(canvas_card, text="click = add/select ROI  -  drag = pan  -  wheel = zoom  -  scroll on selected ROI = resize",
                      font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=14, pady=(10, 6))
         wrap = ctk.CTkFrame(canvas_card, fg_color=BG_CANVAS, corner_radius=10)
         wrap.pack(fill="both", expand=True, padx=14, pady=(0, 14))
@@ -1113,7 +1113,7 @@ class DustInspectorApp:
         self.original = img
         self.fit_roi_view()
         self._render_main_feed()
-        self.footer_var.set(f"Loaded {os.path.basename(path)} (static — live feed paused). Reconnect camera to resume live view.")
+        self.footer_var.set(f"Loaded {os.path.basename(path)} (static -- live feed paused). Reconnect camera to resume live view.")
 
     def test_detection_once(self):
         if self.original is None or not self.rois:
@@ -1200,7 +1200,7 @@ class DustInspectorApp:
         self.min_area_var = tk.StringVar(value=str(self.settings["min_area"]))
         self.min_circ_var = tk.StringVar(value=str(self.settings["min_circularity"]))
         self.min_diam_var = tk.StringVar(value=str(self.settings["min_diameter_mm"]))
-        self._field(row2, "Min blob area (px²)", self.min_area_var, width=90).pack(side="left", padx=(0, 16))
+        self._field(row2, "Min blob area (px^2)", self.min_area_var, width=90).pack(side="left", padx=(0, 16))
         self._field(row2, "Min circularity (0-1)", self.min_circ_var, width=100).pack(side="left", padx=(0, 16))
         self._field(row2, "Min dust diameter (mm)", self.min_diam_var, width=100).pack(side="left", padx=(0, 16))
 
@@ -1242,11 +1242,11 @@ class DustInspectorApp:
         row.pack(fill="x", padx=18, pady=(10, 18))
         self.exposure_var = tk.StringVar(value=str(self.settings["exposure_us"]))
         self.gain_var = tk.StringVar(value=str(self.settings["gain"]))
-        self._field(row, "Exposure (µs)", self.exposure_var).pack(side="left", padx=(0, 20))
+        self._field(row, "Exposure (us)", self.exposure_var).pack(side="left", padx=(0, 20))
         self._field(row, "Gain", self.gain_var).pack(side="left", padx=(0, 20))
         self._btn_primary(row, "Apply", self._apply_camera_settings, width=90).pack(side="left", padx=(0, 10), pady=(18, 0))
         self._btn_secondary(row, "Connect / Reconnect", self._reconnect_camera, width=160).pack(side="left", pady=(18, 0))
-        ctk.CTkLabel(card, text="Gain amplifies sensor noise along with brightness — prefer raising Exposure over Gain.",
+        ctk.CTkLabel(card, text="Gain amplifies sensor noise along with brightness -- prefer raising Exposure over Gain.",
                      font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 14))
 
     def _apply_camera_settings(self):
@@ -1270,12 +1270,12 @@ class DustInspectorApp:
             self.using_static_image = False
             self.cam.apply_settings(exposure_us=self.settings.get("exposure_us"), gain=self.settings.get("gain"))
             self.cam.start_live()
-            self.footer_var.set("Camera connected — live feed running.")
+            self.footer_var.set("Camera connected -- live feed running.")
         else:
             messagebox.showwarning("Camera", msg)
 
     # ---------------------------------------------- ROI canvas interaction
-    # (Only the Teaching window's ROI canvas can add/move/resize ROIs — the
+    # (Only the Teaching window's ROI canvas can add/move/resize ROIs -- the
     # main operator feed only zooms/pans for viewing, it never touches ROI
     # data, which is what fixes the ROI "slip": a stray click on the
     # operator's feed used to be able to add, move, or resize an ROI
