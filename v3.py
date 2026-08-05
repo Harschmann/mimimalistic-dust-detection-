@@ -127,7 +127,7 @@ DEFAULT_SETTINGS = {
     "min_diameter_mm": 0.1,
     "min_aspect_ratio": 3.0,
     "max_thin_width_px": 8.0,
-    "min_straightness": 0.55,
+    "max_arc_fit_residual": 0.12,
     "vinyl_tolerance_px": 15.0,
     "vinyl_strength_thr": 6.0,
     "model_name": "",
@@ -258,28 +258,82 @@ class CameraManager:
 
 
 # ---------------------------------------------------------------- detect ----
+def _fit_circle(pts):
+    """Algebraic (Kasa) least-squares circle fit through a set of 2D
+    points. Returns (radius, rms_residual) -- residual is how far the
+    points typically sit from that best-fit circle (0 = perfect fit).
+    Returns (None, None) if the fit is degenerate."""
+    x, y = pts[:, 0], pts[:, 1]
+    A = np.column_stack([2 * x, 2 * y, np.ones(len(x))])
+    b = x ** 2 + y ** 2
+    try:
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except Exception:
+        return None, None
+    a_c, b_c, c = sol
+    r2 = c + a_c ** 2 + b_c ** 2
+    if r2 <= 0:
+        return None, None
+    r = np.sqrt(r2)
+    dists = np.sqrt((x - a_c) ** 2 + (y - b_c) ** 2)
+    resid = float(np.sqrt(np.mean((dists - r) ** 2)))
+    return float(r), resid
+
+
+def _measure_elongated_shape(contour, frame_shape):
+    """Length/width that stay meaningful even when the shape curves.
+    minAreaRect's short side is NOT a reliable width for a curved thin
+    shape -- a curve's sagitta inflates its own rotated bounding box, so a
+    genuinely thin curved thread can measure as "wide" by that method.
+    Width here instead comes from the distance transform (2x the max
+    distance to the nearest background pixel = the stroke's actual
+    thickness, regardless of how much it curves); length comes from
+    perimeter/2 (a thin closed contour traces both sides of the shape, so
+    its total perimeter is roughly twice the shape's path length)."""
+    x, y, w, h = cv2.boundingRect(contour)
+    pad = 3
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(frame_shape[1], x + w + pad), min(frame_shape[0], y + h + pad)
+    local = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    cv2.drawContours(local, [contour - [x0, y0]], -1, 255, -1)
+    dist = cv2.distanceTransform(local, cv2.DIST_L2, 5)
+    width_px = 2.0 * float(dist.max())
+    length_px = cv2.arcLength(contour, True) / 2.0
+    return length_px, width_px
+
+
 def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity=0.55,
                           mm_per_px=None, min_diameter_mm=0.0,
-                          min_aspect_ratio=3.0, max_thin_width_px=8.0, min_straightness=0.55):
+                          min_aspect_ratio=3.0, max_thin_width_px=8.0, max_arc_fit_residual=0.12):
     """Core Z-score math is UNCHANGED: local Z-score via boxFilter mean/std,
     thresholded inside the union of all circular ROI masks.
 
     Every surviving connected blob is then classified by SHAPE:
-      - round + big + circular enough                         -> DUST
-      - elongated (aspect >= min_aspect_ratio), thin (short
-        side <= max_thin_width_px), and fills its own straight
-        bounding rectangle well (extent >= min_straightness)   -> THREAD/FIBER
-      - elongated + thin but does NOT fill its bounding
-        rectangle well (a curved arc bows out and leaves empty
-        corners in a straight box)                             -> ARC, rejected
-      - elongated + wide (short side > max_thin_width_px)      -> GLUE
+      - round + big + circular enough                          -> DUST
+      - elongated (length/width >= min_aspect_ratio), thin
+        (width <= max_thin_width_px), and its points do NOT fit
+        a large circle well                                     -> THREAD/FIBER
+      - elongated + thin AND its points cleanly fit a circle
+        much bigger than itself                                 -> ARC, rejected
+      - elongated + wide (width > max_thin_width_px)            -> GLUE
 
-    This replaces an earlier blanket morphological opening: that approach
+    Why fit-to-a-circle instead of just "is it curved": a real optical
+    reflection or lens/coating edge is a segment of one PHYSICALLY FIXED
+    circle (the lens/module geometry), so it fits a single circle almost
+    perfectly. A real thread that fell and landed on the module can bend
+    into pretty much any shape -- but it essentially never happens to
+    trace a clean arc of one big fixed-radius circle. So "is this shape
+    curved" is the wrong question (a real thread is very often curved
+    too); "does this shape trace a genuine large circle" is the right one,
+    and that's what's tested here, on the actual contour points -- not on
+    a straight bounding-box proxy, which breaks down for curved shapes.
+
+    This replaced an earlier blanket morphological opening: that approach
     reliably erased thin curved lens/reflection arcs, but it also erased
     genuinely thin thread/fiber contamination, since both are "thin"
     shapes geometrically -- one blunt filter can't tell them apart. A
     light CLOSING is used instead (bridges tiny gaps in a thin shape's
-    raw mask, never erases it), and the arc/thread split happens by shape
+    raw mask, never erases it), and classification happens by shape
     afterwards, on the whole contour.
 
     If the app has been calibrated (mm_per_px set via two-point calibration),
@@ -309,7 +363,7 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     cleaned = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, kernel)
 
-    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     blobs = []
     binary = np.zeros_like(cleaned)
     rejected = 0
@@ -337,31 +391,39 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
             continue
 
         # not round -- is it a real elongated shape at all?
-        (rcx, rcy), (rw, rh), _angle = cv2.minAreaRect(c)
-        long_side, short_side = max(rw, rh), max(min(rw, rh), 1e-6)
-        aspect = long_side / short_side
-        if aspect < min_aspect_ratio:
+        length_px, width_px = _measure_elongated_shape(c, gray.shape)
+        if length_px < 1e-6 or (length_px / max(width_px, 1e-6)) < min_aspect_ratio:
             rejected += 1
             continue  # neither round nor elongated enough -- ambiguous, drop
 
-        extent = area / (rw * rh + 1e-6)  # how much of its own straight bounding box it fills
-        r_draw = max(long_side / 2.0, 3.0)
+        r_draw = max(length_px / 2.0, 3.0)
+        (rcx, rcy) = c.reshape(-1, 2).mean(axis=0)
 
-        if short_side <= max_thin_width_px:
-            if extent < min_straightness:
-                rejected += 1
-                continue  # thin + curved -- an arc (lens/coating reflection), not real contamination
-            btype = "thread"
-        else:
+        if width_px > max_thin_width_px:
             btype = "glue"
+        else:
+            is_arc = False
+            pts = c.reshape(-1, 2).astype(np.float64)
+            if len(pts) >= 8:
+                fit_r, resid = _fit_circle(pts)
+                if fit_r is not None:
+                    norm_resid = resid / max(length_px, 1e-6)
+                    radius_ratio = fit_r / max(length_px, 1e-6)
+                    if norm_resid <= max_arc_fit_residual and 1.2 <= radius_ratio <= 25.0:
+                        is_arc = True
+            if is_arc:
+                rejected += 1
+                continue  # a clean fit to one circle much bigger than itself -- a real
+                          # optical reflection/rim (fixed lens geometry), not contamination
+            btype = "thread"
 
         if mm_per_px:
-            label = f"{btype} {long_side * mm_per_px:.2f}x{short_side * mm_per_px:.2f}mm"
+            label = f"{btype} {length_px * mm_per_px:.2f}x{width_px * mm_per_px:.2f}mm"
         else:
-            label = f"{btype} {long_side:.0f}x{short_side:.0f}px"
+            label = f"{btype} {length_px:.0f}x{width_px:.0f}px"
 
         blobs.append({"type": btype, "cx": float(rcx), "cy": float(rcy), "r": float(r_draw),
-                      "length_px": float(long_side), "width_px": float(short_side), "label": label})
+                      "length_px": float(length_px), "width_px": float(width_px), "label": label})
         cv2.drawContours(binary, [c], -1, 255, -1)
 
     stats = None
@@ -371,6 +433,7 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
                  "dust_px": int((binary == 255).sum()), "dust_count": len(blobs),
                  "rejected": rejected}
     return binary, blobs, stats
+
 
 
 def detect_vinyl_presence(gray, cx, cy, roi_radius, tolerance_px=15.0, strength_ratio_thr=6.0):
@@ -932,7 +995,7 @@ class DustInspectorApp:
                 _binary, blobs, _stats = run_zscore_detection(
                     frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
                     s.get("scale_mm_per_px"), s["min_diameter_mm"],
-                    s["min_aspect_ratio"], s["max_thin_width_px"], s["min_straightness"])
+                    s["min_aspect_ratio"], s["max_thin_width_px"], s["max_arc_fit_residual"])
                 result["blobs"] = blobs
             except Exception:
                 result["blobs"] = []
@@ -1204,7 +1267,7 @@ class DustInspectorApp:
         binary, blobs, stats = run_zscore_detection(
             self.original, self.rois, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
             s.get("scale_mm_per_px"), s["min_diameter_mm"],
-            s["min_aspect_ratio"], s["max_thin_width_px"], s["min_straightness"])
+            s["min_aspect_ratio"], s["max_thin_width_px"], s["max_arc_fit_residual"])
         gray = cv2.cvtColor(self.original, cv2.COLOR_BGR2GRAY)
         vinyl_hits = []
         vinyl_per_roi = []  # every ROI's number, not just the ones that passed -- for diagnosing why some ROIs don't flag
@@ -1213,7 +1276,7 @@ class DustInspectorApp:
                 gray, roi["cx"], roi["cy"], roi["r"],
                 tolerance_px=s.get("vinyl_tolerance_px", 15.0),
                 strength_ratio_thr=s.get("vinyl_strength_thr", 6.0))
-            vinyl_per_roi.append((i + 1, detected, info.get("strength_ratio", 0.0)))
+            vinyl_per_roi.append((i + 1, detected, info.get("strength_ratio", 0.0), info.get("peak_radius_px", 0)))
             if detected:
                 vinyl_hits.append({"roi": roi, "info": info})
         self.last_blobs = blobs
@@ -1227,8 +1290,8 @@ class DustInspectorApp:
         msg = ", ".join(f"{n} {t}" for t, n in counts.items()) or "no defects"
         if stats:
             msg += f" | max_z={stats['max_z']:.2f} rejected={stats['rejected']}"
-        vinyl_txt = " ".join(f"ROI{n}={s_:.1f}{'*' if d else ''}" for n, d, s_ in vinyl_per_roi)
-        msg += f" | vinyl: {vinyl_txt}"
+        vinyl_txt = " ".join(f"ROI{n}={s_:.1f}{'*' if d else ''}@r{rp}" for n, d, s_, rp in vinyl_per_roi)
+        msg += f" | vinyl(strength@peak_radius): {vinyl_txt}"
         self.footer_var.set("Test detection: " + msg)
 
     # ---- calibration (shares ROI canvas clicks) -----------------------
@@ -1295,11 +1358,11 @@ class DustInspectorApp:
         row3.pack(fill="x", padx=18, pady=(0, 8))
         self.min_aspect_var = tk.StringVar(value=str(self.settings["min_aspect_ratio"]))
         self.max_thin_var = tk.StringVar(value=str(self.settings["max_thin_width_px"]))
-        self.min_straight_var = tk.StringVar(value=str(self.settings["min_straightness"]))
+        self.arc_fit_var = tk.StringVar(value=str(self.settings["max_arc_fit_residual"]))
         self._field(row3, "Min elongation ratio", self.min_aspect_var, width=90).pack(side="left", padx=(0, 16))
         self._field(row3, "Max thread/arc width (px)", self.max_thin_var, width=110).pack(side="left", padx=(0, 16))
-        self._field(row3, "Min straightness (0-1)", self.min_straight_var, width=100).pack(side="left", padx=(0, 16))
-        ctk.CTkLabel(card, text="Elongated + thin + straight = thread (kept). Elongated + thin + curved = arc (rejected, lens/coating reflection). Elongated + wide = glue.",
+        self._field(row3, "Arc-fit tolerance (0-1)", self.arc_fit_var, width=100).pack(side="left", padx=(0, 16))
+        ctk.CTkLabel(card, text="A thin elongated blob is rejected as an arc (lens/coating reflection) only if it cleanly fits ONE circle much bigger than itself -- a real thread can curve too, but essentially never traces a perfect large arc, so curvature alone no longer disqualifies it. Lower the tolerance to be stricter about what counts as a clean circle fit.",
                      font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 8))
 
         row4 = ctk.CTkFrame(card, fg_color="transparent")
@@ -1309,7 +1372,7 @@ class DustInspectorApp:
         self._field(row4, "Vinyl tolerance (px)", self.vinyl_tol_var, width=90).pack(side="left", padx=(0, 16))
         self._field(row4, "Vinyl strength threshold", self.vinyl_thr_var, width=100).pack(side="left", padx=(0, 16))
         self._btn_primary(row4, "Save", self._save_detection_settings, width=100).pack(side="left", pady=(18, 0))
-        ctk.CTkLabel(card, text="Vinyl tolerance is a band on BOTH sides of the ROI radius (radius +/- this many px), not a one-directional offset -- typical value is 10-30px; large values risk picking up unrelated edges.",
+        ctk.CTkLabel(card, text="Vinyl tolerance is a band on BOTH sides of the ROI radius (radius +/- this many px), not a one-directional offset. If the real cutout is genuinely far from your ROI center, a large value (its own real behavior, not an error) is fine and expected -- Test Detection shows peak_radius per ROI so you can confirm it's finding the actual cutout edge and not some other feature. The tradeoff: a wider band also raises the chance of latching onto an unrelated edge, so use the smallest tolerance that still reliably finds it.",
                      font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 14))
 
     def _save_detection_settings(self):
@@ -1322,7 +1385,7 @@ class DustInspectorApp:
             self.settings["min_diameter_mm"] = float(self.min_diam_var.get())
             self.settings["min_aspect_ratio"] = float(self.min_aspect_var.get())
             self.settings["max_thin_width_px"] = float(self.max_thin_var.get())
-            self.settings["min_straightness"] = float(self.min_straight_var.get())
+            self.settings["max_arc_fit_residual"] = float(self.arc_fit_var.get())
             self.settings["vinyl_tolerance_px"] = float(self.vinyl_tol_var.get())
             self.settings["vinyl_strength_thr"] = float(self.vinyl_thr_var.get())
         except ValueError:
