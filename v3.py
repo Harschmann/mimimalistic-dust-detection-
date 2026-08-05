@@ -442,7 +442,7 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
     debug_images = None
     if debug:
         debug_images = {}
-        debug_images["1 Grayscale"] = np.clip(gray, 0, 255).astype(np.uint8)
+        debug_images["1 Grayscale"] = cv2.cvtColor(np.clip(gray, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
         z_ceiling = max(z_thr * 3.0, 1.0)
         z_norm = (np.clip(zscore, 0, z_ceiling) / z_ceiling * 255).astype(np.uint8)
         debug_images["2 Z-score heatmap"] = cv2.applyColorMap(z_norm, cv2.COLORMAP_INFERNO)
@@ -540,6 +540,121 @@ CANVAS_H = 560
 ROI_HIT_TOL = 6
 
 
+class ZoomableImageCanvas:
+    """A tk.Canvas that displays a BGR (OpenCV) image with mouse-wheel zoom
+    (cursor-anchored) and click-drag pan -- the same interaction as every
+    other image view in this app. Each instance owns its own independent
+    zoom/pan state, so multiple of these side by side (e.g. one per
+    pipeline stage) don't affect each other."""
+
+    def __init__(self, parent, width=420, height=420, bg=None):
+        bg = bg or BG_CANVAS
+        self.canvas = tk.Canvas(parent, width=width, height=height, bg=bg, highlightthickness=0)
+        self.image = None
+        self.zoom = 1.0
+        self.base_scale = 1.0
+        self.view_x = 0.0
+        self.view_y = 0.0
+        self._fitted = False
+        self._dragging = False
+        self._drag_start = (0, 0)
+        self._last = (0, 0)
+        self.photo = None
+        self.canvas.bind("<MouseWheel>", self.on_wheel)
+        self.canvas.bind("<Button-4>", self.on_wheel)
+        self.canvas.bind("<Button-5>", self.on_wheel)
+        self.canvas.bind("<ButtonPress-1>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<Configure>", lambda e: self._render())
+
+    def set_image(self, bgr):
+        self.image = bgr
+        self._fitted = False
+        self._render()
+
+    def _canvas_wh(self):
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if w < 10 or h < 10:
+            return 420, 420
+        return w, h
+
+    def fit(self):
+        if self.image is None:
+            return
+        cw, ch = self._canvas_wh()
+        h, w = self.image.shape[:2]
+        self.base_scale = min(cw / w, ch / h)
+        self.zoom = 1.0
+        s = self.base_scale
+        self.view_x = (cw - w * s) / 2
+        self.view_y = (ch - h * s) / 2
+        self._fitted = True
+        self._render()
+
+    def _apply_zoom(self, factor, cx, cy):
+        if self.image is None:
+            return
+        s_old = self.base_scale * self.zoom
+        ix = (cx - self.view_x) / s_old
+        iy = (cy - self.view_y) / s_old
+        self.zoom = max(0.2, min(self.zoom * factor, 30.0))
+        s_new = self.base_scale * self.zoom
+        self.view_x = cx - ix * s_new
+        self.view_y = cy - iy * s_new
+        self._render()
+
+    def on_wheel(self, event):
+        if self.image is None:
+            return
+        direction = 1 if (getattr(event, "delta", 0) > 0 or getattr(event, "num", None) == 4) else -1
+        factor = 1.2 if direction > 0 else 1 / 1.2
+        self._apply_zoom(factor, event.x, event.y)
+
+    def on_press(self, event):
+        self._drag_start = (event.x, event.y)
+        self._last = (event.x, event.y)
+        self._dragging = False
+
+    def on_drag(self, event):
+        if self.image is None:
+            return
+        if not self._dragging:
+            if abs(event.x - self._drag_start[0]) + abs(event.y - self._drag_start[1]) > 4:
+                self._dragging = True
+        if not self._dragging:
+            return
+        self.view_x += event.x - self._last[0]
+        self.view_y += event.y - self._last[1]
+        self._last = (event.x, event.y)
+        self._render()
+
+    def _render(self):
+        self.canvas.delete("all")
+        if self.image is None:
+            return
+        if not self._fitted:
+            self.fit()
+            return
+        cw, ch = self._canvas_wh()
+        H, W = self.image.shape[:2]
+        s = self.base_scale * self.zoom
+        vx, vy = self.view_x, self.view_y
+        l = max(0, int(-vx / s))
+        t = max(0, int(-vy / s))
+        r = min(W, int((cw - vx) / s) + 1)
+        b = min(H, int((ch - vy) / s) + 1)
+        if r <= l or b <= t:
+            return
+        crop = self.image[t:b, l:r]
+        cwid = max(1, int((r - l) * s))
+        chei = max(1, int((b - t) * s))
+        interp = cv2.INTER_NEAREST if self.zoom > 1.0 else cv2.INTER_AREA
+        resized = cv2.resize(crop, (cwid, chei), interpolation=interp)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self.canvas.create_image(vx + l * s, vy + t * s, anchor="nw", image=self.photo)
+
+
 # =============================================================== MAIN APP ==
 class DustInspectorApp:
     def __init__(self, root):
@@ -594,7 +709,7 @@ class DustInspectorApp:
         self.main_photo = None
         self.roi_photo = None
         self._pipeline_images = {}
-        self.pipeline_photos = []
+        self.pipeline_canvases = []
 
         self.model_line_var = tk.StringVar(value=self._model_line_text())
         self.status_var = tk.StringVar(value="IDLE")
@@ -713,31 +828,39 @@ class DustInspectorApp:
         top.pack(fill="x", pady=(0, 8))
         ctk.CTkLabel(top, text="Pipeline Steps", font=self.f_title, text_color=TEXT).pack(side="left")
         self._btn_secondary(top, "Back to Teaching", self.show_teaching_page, width=160).pack(side="right")
-        ctk.CTkLabel(page, text="What Test Detection actually did to the last frame, stage by stage.",
+        ctk.CTkLabel(page, text="What Test Detection actually did to the last frame, stage by stage. Wheel = zoom, drag = pan, on each image independently. Scrollbar moves between stages.",
                      font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", pady=(0, 8))
 
-        self.pipeline_scroll = ctk.CTkScrollableFrame(page, fg_color=BG)
-        self.pipeline_scroll.pack(fill="both", expand=True)
-        self.pipeline_photos = []  # keep PhotoImage refs alive -- Tkinter drops them otherwise
+        # Manual horizontal-scroll container (NOT CTkScrollableFrame, which
+        # binds mouse wheel to scrolling -- that would fight with wheel-zoom
+        # on each stage's image). Wheel stays free for zoom; the scrollbar
+        # (drag it, or shift+wheel) moves between stages instead.
+        outer = ctk.CTkFrame(page, fg_color=BG)
+        outer.pack(fill="both", expand=True)
+        self.pipeline_hcanvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        hbar = ctk.CTkScrollbar(outer, orientation="horizontal", command=self.pipeline_hcanvas.xview)
+        self.pipeline_hcanvas.configure(xscrollcommand=hbar.set)
+        hbar.pack(side="bottom", fill="x")
+        self.pipeline_hcanvas.pack(side="top", fill="both", expand=True)
+
+        self.pipeline_inner = ctk.CTkFrame(self.pipeline_hcanvas, fg_color=BG)
+        self._pipeline_inner_window = self.pipeline_hcanvas.create_window((0, 0), window=self.pipeline_inner, anchor="nw")
+        self.pipeline_inner.bind("<Configure>", lambda e: self.pipeline_hcanvas.configure(
+            scrollregion=self.pipeline_hcanvas.bbox("all")))
+        self.pipeline_canvases = []  # ZoomableImageCanvas instances, one per stage
 
     def _populate_pipeline_page(self):
-        for widget in self.pipeline_scroll.winfo_children():
+        for widget in self.pipeline_inner.winfo_children():
             widget.destroy()
-        self.pipeline_photos = []
+        self.pipeline_canvases = []
         for name, img in self._pipeline_images.items():
-            card = self._card(self.pipeline_scroll)
-            card.pack(fill="x", pady=8, padx=4)
+            card = self._card(self.pipeline_inner)
+            card.pack(side="left", fill="y", padx=8, pady=4)
             ctk.CTkLabel(card, text=name, font=self.f_section, text_color=TEXT).pack(anchor="w", padx=14, pady=(12, 6))
-            h, w = img.shape[:2]
-            max_w = 900
-            scale = min(1.0, max_w / w)
-            nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_NEAREST
-            resized = cv2.resize(img, (nw, nh), interpolation=interp)
-            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-            self.pipeline_photos.append(photo)
-            tk.Label(card, image=photo, bg=BG_CANVAS, borderwidth=0).pack(padx=14, pady=(0, 14))
+            zc = ZoomableImageCanvas(card, width=520, height=520)
+            zc.canvas.pack(padx=14, pady=(0, 14))
+            zc.set_image(img)
+            self.pipeline_canvases.append(zc)
 
     def _build_operator_page(self, page):
         body = ctk.CTkFrame(page, fg_color="transparent")
