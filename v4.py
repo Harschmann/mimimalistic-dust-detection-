@@ -679,6 +679,8 @@ class DustInspectorApp:
         self.f_op_barcode = ctk.CTkFont(size=24)
         self.f_op_button = ctk.CTkFont(size=26, weight="bold")
         self.f_op_button_sm = ctk.CTkFont(size=16, weight="bold")
+        self.f_op_counter_num = ctk.CTkFont(size=30, weight="bold")
+        self.f_op_stat_num = ctk.CTkFont(size=38, weight="bold")
 
         self.settings = load_settings()
         self.cam = CameraManager()
@@ -726,6 +728,15 @@ class DustInspectorApp:
         self.barcode_var = tk.StringVar(value="")
         self.footer_var = tk.StringVar(value="Starting up...")
 
+        self.count_checked = 0
+        self.count_passed = 0
+        self.count_failed = 0
+        self.checked_var = tk.StringVar(value="0")
+        self.passed_var = tk.StringVar(value="0")
+        self.failed_var = tk.StringVar(value="0")
+        self.failure_rate_var = tk.StringVar(value="0.0%")
+        self.pass_rate_var = tk.StringVar(value="0.0%")
+
         self._build_main_ui()
         self._load_active_roi_layout()
         self._auto_connect_camera()
@@ -757,6 +768,12 @@ class DustInspectorApp:
         defaults = dict(fg_color=BG_CARD, corner_radius=14, border_width=1, border_color=BORDER)
         defaults.update(kw)
         return ctk.CTkFrame(parent, **defaults)
+
+    def _counter_tile(self, parent, col, value_var, label_text, color, font=None):
+        box = ctk.CTkFrame(parent, fg_color="transparent")
+        box.grid(row=0, column=col, sticky="nsew")
+        ctk.CTkLabel(box, textvariable=value_var, font=font or self.f_op_counter_num, text_color=color).pack()
+        ctk.CTkLabel(box, text=label_text, font=self.f_small, text_color=TEXT_MUTED).pack(pady=(0, 4))
 
     def _field(self, parent, label_text, var, width=140):
         f = ctk.CTkFrame(parent, fg_color="transparent")
@@ -906,31 +923,54 @@ class DustInspectorApp:
         right.grid(row=0, column=1, sticky="nsew")
 
         status_card = self._card(right)
-        status_card.pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(status_card, text="STATUS", font=self.f_op_label, text_color=TEXT_MUTED).pack(anchor="w", padx=20, pady=(16, 0))
+        status_card.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(status_card, text="STATUS", font=self.f_op_label, text_color=TEXT_MUTED).pack(anchor="w", padx=20, pady=(12, 0))
         self.status_label = ctk.CTkLabel(status_card, textvariable=self.status_var, font=self.f_op_status, text_color=TEXT_MUTED)
-        self.status_label.pack(anchor="w", padx=20, pady=(0, 18))
+        self.status_label.pack(anchor="w", padx=20, pady=(0, 14))
+
+        counters_card = self._card(right)
+        counters_card.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(counters_card, text="TODAY'S COUNT", font=self.f_op_label, text_color=TEXT_MUTED).pack(anchor="w", padx=20, pady=(12, 6))
+        counters_row = ctk.CTkFrame(counters_card, fg_color="transparent")
+        counters_row.pack(fill="x", padx=10, pady=(0, 14))
+        counters_row.grid_columnconfigure(0, weight=1)
+        counters_row.grid_columnconfigure(1, weight=1)
+        counters_row.grid_columnconfigure(2, weight=1)
+        self._counter_tile(counters_row, 0, self.checked_var, "CHECKED", TEXT)
+        self._counter_tile(counters_row, 1, self.passed_var, "PASSED", SUCCESS)
+        self._counter_tile(counters_row, 2, self.failed_var, "FAILED", DANGER)
+
+        stats_card = self._card(right)
+        stats_card.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(stats_card, text="STATS", font=self.f_op_label, text_color=TEXT_MUTED).pack(anchor="w", padx=20, pady=(12, 6))
+        stats_row = ctk.CTkFrame(stats_card, fg_color="transparent")
+        stats_row.pack(fill="x", padx=10, pady=(0, 4))
+        stats_row.grid_columnconfigure(0, weight=1)
+        stats_row.grid_columnconfigure(1, weight=1)
+        self._counter_tile(stats_row, 0, self.failure_rate_var, "FAILURE RATE", DANGER, font=self.f_op_stat_num)
+        self._counter_tile(stats_row, 1, self.pass_rate_var, "PASS RATE", SUCCESS, font=self.f_op_stat_num)
+        self._btn_secondary(stats_card, "Reset Counters", self.reset_counters, width=160, height=32).pack(pady=(4, 12))
 
         findings_card = self._card(right)
-        findings_card.pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(findings_card, text="FINDINGS", font=self.f_op_label, text_color=TEXT_MUTED).pack(anchor="w", padx=20, pady=(16, 4))
+        findings_card.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(findings_card, text="FINDINGS", font=self.f_op_label, text_color=TEXT_MUTED).pack(anchor="w", padx=20, pady=(12, 4))
         self.findings_var = tk.StringVar(value="--")
         ctk.CTkLabel(findings_card, textvariable=self.findings_var, font=self.f_op_findings, text_color=TEXT,
-                     justify="left", anchor="w").pack(anchor="w", padx=20, pady=(0, 16))
+                     justify="left", anchor="w").pack(anchor="w", padx=20, pady=(0, 12))
 
         barcode_card = self._card(right)
-        barcode_card.pack(fill="x", pady=(0, 10))
-        ctk.CTkLabel(barcode_card, text="BARCODE", font=self.f_op_label, text_color=TEXT_MUTED).pack(anchor="w", padx=20, pady=(16, 6))
+        barcode_card.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(barcode_card, text="BARCODE", font=self.f_op_label, text_color=TEXT_MUTED).pack(anchor="w", padx=20, pady=(12, 6))
         self.barcode_entry = ctk.CTkEntry(barcode_card, textvariable=self.barcode_var, font=self.f_op_barcode,
-                                           corner_radius=10, height=52, fg_color=BG_CARD_ALT, border_color=BORDER, text_color=TEXT)
-        self.barcode_entry.pack(fill="x", padx=20, pady=(0, 18))
+                                           corner_radius=10, height=48, fg_color=BG_CARD_ALT, border_color=BORDER, text_color=TEXT)
+        self.barcode_entry.pack(fill="x", padx=20, pady=(0, 14))
 
-        self.start_btn = self._btn_primary(right, "Start", self.start_inspection, width=200, height=78,
+        self.start_btn = self._btn_primary(right, "Start", self.start_inspection, width=200, height=64,
                                             font=self.f_op_button)
-        self.start_btn.pack(fill="x", pady=(0, 10))
+        self.start_btn.pack(fill="x", pady=(0, 8))
 
-        self._btn_secondary(right, "Clear Markings", self.clear_detection_markings, width=200, height=48,
-                             font=self.f_op_button_sm).pack(fill="x", pady=(0, 10))
+        self._btn_secondary(right, "Clear Markings", self.clear_detection_markings, width=200, height=40,
+                             font=self.f_op_button_sm).pack(fill="x", pady=(0, 8))
 
         log_card = self._card(right)
         log_card.pack(fill="both", expand=True)
@@ -1231,11 +1271,36 @@ class DustInspectorApp:
         color = SUCCESS if verdict == "PASS" else DANGER
         self._set_status(verdict, color)
         self.findings_var.set(self._build_findings_text(blobs))
+        self.count_checked += 1
+        if verdict == "PASS":
+            self.count_passed += 1
+        else:
+            self.count_failed += 1
+        self._update_stats_display()
         self._render_main_feed()
         self.inspection_running = False
-        self.start_btn.configure(text="Start Inspection", state="normal", fg_color=ACCENT)
+        self.start_btn.configure(text="Start", state="normal", fg_color=ACCENT)
         self.barcode_var.set("")
         self.barcode_entry.focus_set()
+
+    def _update_stats_display(self):
+        self.checked_var.set(str(self.count_checked))
+        self.passed_var.set(str(self.count_passed))
+        self.failed_var.set(str(self.count_failed))
+        if self.count_checked > 0:
+            fail_rate = 100.0 * self.count_failed / self.count_checked
+            pass_rate = 100.0 * self.count_passed / self.count_checked
+        else:
+            fail_rate = pass_rate = 0.0
+        self.failure_rate_var.set(f"{fail_rate:.1f}%")
+        self.pass_rate_var.set(f"{pass_rate:.1f}%")
+
+    def reset_counters(self):
+        self.count_checked = 0
+        self.count_passed = 0
+        self.count_failed = 0
+        self._update_stats_display()
+        self.footer_var.set("Counters reset.")
 
     # =================================================== TEACHING PAGE ==
 
