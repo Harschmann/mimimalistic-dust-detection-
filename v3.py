@@ -19,24 +19,18 @@ Single-file desktop app, restructured into TWO windows:
      ROI placement + two-point calibration (the one interactive canvas
      in the whole app), detection parameters, and camera settings.
 
-INSPECTION IS MULTITHREADED: each Start Inspection press runs on its own
-background thread (so the UI/feed never freezes), and INSIDE that, the
-two independent detectors run on their OWN parallel threads and are
-joined before finishing:
-  - dust/contamination detection (run_zscore_detection) -- the validated
-    local Z-score algorithm, UNCHANGED
-  - protective vinyl/lamination-film detection (detect_vinyl_presence) --
-    a polar-unrolled radial edge-energy check for the film's die-cut
-    cutout ring around the lens opening
-These two don't depend on each other (both only need the frame + ROIs),
-so running them in parallel instead of one-after-another cuts total
-inspection time to roughly max(dust_time, vinyl_time) instead of the sum.
-Saving result images and writing the CSV log also happens on the
+Single-threaded detection call per inspection (dust/thread/glue
+classification via run_zscore_detection), still run on a background
+thread so the UI/feed never freezes. (Vinyl/lamination-film detection --
+detect_vinyl_presence -- is implemented below but not currently wired
+into the active inspection flow; re-enable later once the fiber/thread
+detection is solid and the UI has been reworked.)
+Saving result images and writing the CSV log also happens on that
 background thread -- only the final status/log-box/button update is
 handed back to the main thread, since that's the only part that has to
 touch Tkinter widgets.
 
-storage/ layout: source_images/, results/NG|OK|VINYL/, roi_configs/,
+storage/ layout: source_images/, results/NG|OK/, roi_configs/,
 logs/, settings.json
 
 Run:  python dust_inspector_app.py
@@ -128,6 +122,7 @@ DEFAULT_SETTINGS = {
     "min_aspect_ratio": 3.0,
     "max_thin_width_px": 8.0,
     "max_arc_fit_residual": 0.12,
+    "gap_bridge_px": 11.0,
     "vinyl_tolerance_px": 15.0,
     "vinyl_strength_thr": 6.0,
     "model_name": "",
@@ -280,31 +275,11 @@ def _fit_circle(pts):
     return float(r), resid
 
 
-def _measure_elongated_shape(contour, frame_shape):
-    """Length/width that stay meaningful even when the shape curves.
-    minAreaRect's short side is NOT a reliable width for a curved thin
-    shape -- a curve's sagitta inflates its own rotated bounding box, so a
-    genuinely thin curved thread can measure as "wide" by that method.
-    Width here instead comes from the distance transform (2x the max
-    distance to the nearest background pixel = the stroke's actual
-    thickness, regardless of how much it curves); length comes from
-    perimeter/2 (a thin closed contour traces both sides of the shape, so
-    its total perimeter is roughly twice the shape's path length)."""
-    x, y, w, h = cv2.boundingRect(contour)
-    pad = 3
-    x0, y0 = max(0, x - pad), max(0, y - pad)
-    x1, y1 = min(frame_shape[1], x + w + pad), min(frame_shape[0], y + h + pad)
-    local = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
-    cv2.drawContours(local, [contour - [x0, y0]], -1, 255, -1)
-    dist = cv2.distanceTransform(local, cv2.DIST_L2, 5)
-    width_px = 2.0 * float(dist.max())
-    length_px = cv2.arcLength(contour, True) / 2.0
-    return length_px, width_px
-
 
 def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity=0.55,
                           mm_per_px=None, min_diameter_mm=0.0,
-                          min_aspect_ratio=3.0, max_thin_width_px=8.0, max_arc_fit_residual=0.12):
+                          min_aspect_ratio=3.0, max_thin_width_px=8.0, max_arc_fit_residual=0.12,
+                          gap_bridge_px=7.0):
     """Core Z-score math is UNCHANGED: local Z-score via boxFilter mean/std,
     thresholded inside the union of all circular ROI masks.
 
@@ -358,27 +333,47 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
 
     raw = np.where((zscore >= z_thr) & (mask == 255), 255, 0).astype(np.uint8)
 
-    # a light closing bridges tiny 1px gaps in a thin thread's raw mask --
-    # unlike an opening, this cannot erase a genuinely thin shape
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    cleaned = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, kernel)
+    # Bridge gaps for CONNECTIVITY ONLY via dilation -- NOT a full closing.
+    # Closing (dilate then erode) turned out to be unreliable here: the
+    # erode half removes a thin bridge just as easily as it would remove
+    # the thread's own thin width, so it often failed to reconnect a
+    # fragmented thread at all. Dilating (no erode) reliably links nearby
+    # fragments; shape is then measured from the ORIGINAL undilated pixels
+    # within each linked region, so linking doesn't inflate the measured
+    # width. (Trade-off: a large gap_bridge_px can also fuse two separate
+    # nearby real defects into one -- tune it to the largest real gap you
+    # see in a fragmented thread, not much more.)
+    gap_k = max(1, int(round(gap_bridge_px)))
+    if gap_k % 2 == 0:
+        gap_k += 1
+    link_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (gap_k, gap_k))
+    linked = cv2.dilate(raw, link_kernel)
 
-    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    link_contours, _ = cv2.findContours(linked, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     blobs = []
-    binary = np.zeros_like(cleaned)
+    binary = np.zeros_like(raw)
     rejected = 0
 
-    for c in contours:
-        area = cv2.contourArea(c)
+    for lc in link_contours:
+        region = np.zeros_like(raw)
+        cv2.drawContours(region, [lc], -1, 255, -1)
+        original = cv2.bitwise_and(raw, region)  # true (undilated) pixels in this linked region
+        area = int(cv2.countNonZero(original))
         if area < min_area:
             rejected += 1
             continue
 
-        perimeter = cv2.arcLength(c, True)
+        frag_contours, _ = cv2.findContours(original, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not frag_contours:
+            rejected += 1
+            continue
+        perimeter = sum(cv2.arcLength(fc, True) for fc in frag_contours)
         circularity = (4 * np.pi * area / (perimeter * perimeter)) if perimeter > 0 else 0.0
 
-        if circularity >= min_circularity:
-            (cx, cy), r = cv2.minEnclosingCircle(c)
+        if circularity >= min_circularity and len(frag_contours) == 1:
+            # only a genuinely solid single blob counts as dust -- a linked
+            # group of several small fragments is never one dust speck
+            (cx, cy), r = cv2.minEnclosingCircle(frag_contours[0])
             diameter_px = 2.0 * r
             diameter_mm = diameter_px * mm_per_px if mm_per_px else None
             if diameter_mm is not None and diameter_mm < min_diameter_mm:
@@ -387,25 +382,27 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
             label = f"{diameter_mm:.2f}mm" if diameter_mm is not None else f"{diameter_px:.0f}px"
             blobs.append({"type": "dust", "cx": float(cx), "cy": float(cy), "r": float(max(r, 3.0)),
                           "diameter_px": float(diameter_px), "diameter_mm": diameter_mm, "label": label})
-            cv2.drawContours(binary, [c], -1, 255, -1)
+            binary = cv2.bitwise_or(binary, original)
             continue
 
         # not round -- is it a real elongated shape at all?
-        length_px, width_px = _measure_elongated_shape(c, gray.shape)
+        dist = cv2.distanceTransform(original, cv2.DIST_L2, 5)
+        width_px = 2.0 * float(dist.max())
+        length_px = perimeter / 2.0
         if length_px < 1e-6 or (length_px / max(width_px, 1e-6)) < min_aspect_ratio:
             rejected += 1
             continue  # neither round nor elongated enough -- ambiguous, drop
 
+        all_pts = np.vstack([fc.reshape(-1, 2) for fc in frag_contours]).astype(np.float64)
+        rcx, rcy = float(all_pts[:, 0].mean()), float(all_pts[:, 1].mean())
         r_draw = max(length_px / 2.0, 3.0)
-        (rcx, rcy) = c.reshape(-1, 2).mean(axis=0)
 
         if width_px > max_thin_width_px:
             btype = "glue"
         else:
             is_arc = False
-            pts = c.reshape(-1, 2).astype(np.float64)
-            if len(pts) >= 8:
-                fit_r, resid = _fit_circle(pts)
+            if len(all_pts) >= 8:
+                fit_r, resid = _fit_circle(all_pts)
                 if fit_r is not None:
                     norm_resid = resid / max(length_px, 1e-6)
                     radius_ratio = fit_r / max(length_px, 1e-6)
@@ -422,9 +419,9 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
         else:
             label = f"{btype} {length_px:.0f}x{width_px:.0f}px"
 
-        blobs.append({"type": btype, "cx": float(rcx), "cy": float(rcy), "r": float(r_draw),
+        blobs.append({"type": btype, "cx": rcx, "cy": rcy, "r": float(r_draw),
                       "length_px": float(length_px), "width_px": float(width_px), "label": label})
-        cv2.drawContours(binary, [c], -1, 255, -1)
+        binary = cv2.bitwise_or(binary, original)
 
     stats = None
     if mask.any():
@@ -540,7 +537,6 @@ class DustInspectorApp:
         self.using_static_image = False
         self.rois = []                 # active ROI set used by the main window
         self.last_blobs = []           # last inspection's accepted blobs: dust/thread/glue
-        self.last_vinyl_hits = []      # last inspection's vinyl-flagged ROIs: [{"roi":..., "info":...}]
         self.inspection_running = False
 
         # teaching-window-only interactive state (ROI editor canvas)
@@ -615,15 +611,6 @@ class DustInspectorApp:
                      fg_color=BG_CARD_ALT, border_color=BORDER, text_color=TEXT).pack(anchor="w", pady=(4, 0))
         return f
 
-    def _is_vinyl_flagged(self, roi):
-        """Matches by position (not object identity) since self.rois can be
-        different dict objects than the snapshot used during the last
-        inspection (e.g. after reloading a layout)."""
-        for h in self.last_vinyl_hits:
-            hr = h["roi"]
-            if abs(hr["cx"] - roi["cx"]) < 1e-6 and abs(hr["cy"] - roi["cy"]) < 1e-6:
-                return True
-        return False
 
     # ==================================================== MAIN OPERATOR UI
     def _build_main_ui(self):
@@ -779,11 +766,10 @@ class DustInspectorApp:
         self.status_label.configure(text_color=color)
 
     def clear_detection_markings(self):
-        """Wipes the last inspection's red/purple overlays off the feed --
-        for when the camera's been unplugged/moved and stale markings are
-        stuck on the last frame it ever delivered."""
+        """Wipes the last inspection's overlays off the feed -- for when
+        the camera's been unplugged/moved and stale markings are stuck on
+        the last frame it ever delivered."""
         self.last_blobs = []
-        self.last_vinyl_hits = []
         self.findings_var.set("--")
         self._set_status("IDLE", TEXT_MUTED)
         self._render_main_feed()
@@ -833,17 +819,12 @@ class DustInspectorApp:
     def _build_main_overlay(self):
         disp = self.original.copy()
         for roi in self.rois:
-            color = VINYL_COLOR_BGR if self._is_vinyl_flagged(roi) else (0, 255, 0)
-            cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), color, 2)
+            cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), (0, 255, 0), 2)
         for b in self.last_blobs:
             cx, cy, r = int(b["cx"]), int(b["cy"]), int(round(b["r"]))
             color = BLOB_COLOR_BGR.get(b["type"], (0, 0, 255))
             cv2.circle(disp, (cx, cy), r + 4, color, 2)
             cv2.putText(disp, b["label"], (cx + r + 10, cy + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3, cv2.LINE_AA)
-        for h in self.last_vinyl_hits:
-            roi = h["roi"]
-            cx, cy, r = int(roi["cx"]), int(roi["cy"]), int(roi["r"])
-            cv2.putText(disp, "VINYL?", (cx - r, cy - r - 12), cv2.FONT_HERSHEY_SIMPLEX, 1.0, VINYL_COLOR_BGR, 3, cv2.LINE_AA)
         return disp
 
     def _canvas_wh_main(self):
@@ -977,78 +958,35 @@ class DustInspectorApp:
 
     def _run_inspection_thread(self, frame, rois_snapshot, barcode):
         """Runs entirely off the main/UI thread (started as a daemon Thread
-        by start_inspection). Inside it, the two independent detectors run
-        on their OWN parallel threads:
-          - contamination classification (dust/thread/glue): run_zscore_detection
-          - vinyl/lamination film: detect_vinyl_presence, once per ROI
-        Neither needs the other's output, so running them concurrently cuts
-        total detection time to roughly max(dust_time, vinyl_time) rather
-        than dust_time + vinyl_time. Saving images and writing the CSV log
-        also happen here (all pure numpy/cv2/file I/O, no Tkinter) -- only
-        the final widget update is handed to the main thread at the end.
+        by start_inspection), so a slow detection pass never blocks the
+        camera feed or the UI. Saving images and writing the CSV log also
+        happen here (all pure numpy/cv2/file I/O, no Tkinter) -- only the
+        final widget update is handed to the main thread at the end.
         """
         s = self.settings
-        result = {}
+        try:
+            _binary, blobs, _stats = run_zscore_detection(
+                frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
+                s.get("scale_mm_per_px"), s["min_diameter_mm"],
+                s["min_aspect_ratio"], s["max_thin_width_px"], s["max_arc_fit_residual"], s["gap_bridge_px"])
+        except Exception:
+            blobs = []
 
-        def run_dust():
-            try:
-                _binary, blobs, _stats = run_zscore_detection(
-                    frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
-                    s.get("scale_mm_per_px"), s["min_diameter_mm"],
-                    s["min_aspect_ratio"], s["max_thin_width_px"], s["max_arc_fit_residual"])
-                result["blobs"] = blobs
-            except Exception:
-                result["blobs"] = []
+        verdict, log_args = self._save_inspection_artifacts(frame, rois_snapshot, blobs, barcode)
 
-        def run_vinyl():
-            try:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                hits = []
-                for roi in rois_snapshot:
-                    detected, info = detect_vinyl_presence(
-                        gray, roi["cx"], roi["cy"], roi["r"],
-                        tolerance_px=s.get("vinyl_tolerance_px", 15.0),
-                        strength_ratio_thr=s.get("vinyl_strength_thr", 6.0))
-                    if detected:
-                        hits.append({"roi": roi, "info": info})
-                result["vinyl"] = hits
-            except Exception:
-                result["vinyl"] = []
+        self.root.after(0, lambda: self._finish_inspection(blobs, verdict, log_args))
 
-        t_dust = threading.Thread(target=run_dust)
-        t_vinyl = threading.Thread(target=run_vinyl)
-        t_dust.start()
-        t_vinyl.start()
-        t_dust.join()
-        t_vinyl.join()
-
-        blobs = result.get("blobs", [])
-        vinyl_hits = result.get("vinyl", [])
-
-        verdict, log_args = self._save_inspection_artifacts(frame, rois_snapshot, blobs, vinyl_hits, barcode)
-
-        self.root.after(0, lambda: self._finish_inspection(blobs, vinyl_hits, verdict, log_args))
-
-    def _save_inspection_artifacts(self, frame, rois_snapshot, blobs, vinyl_hits, barcode):
+    def _save_inspection_artifacts(self, frame, rois_snapshot, blobs, barcode):
         """All cv2/file work for one inspection cycle -- still on the
         background thread, no Tkinter here. Returns (verdict, log_args) --
         log_args gets handed to _append_log_line on the main thread since
         that call touches a Tkinter widget."""
-        is_vinyl = bool(vinyl_hits)
-        is_ng = bool(blobs)
-        if is_vinyl:
-            verdict = "VINYL"   # recorded specifically for the log/filename; the on-screen badge just says FAIL
-        elif is_ng:
-            verdict = "FAIL"
-        else:
-            verdict = "PASS"
+        verdict = "FAIL" if blobs else "PASS"
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        flagged_ids = {id(h["roi"]) for h in vinyl_hits}
         source_disp = frame.copy()
         for roi in rois_snapshot:
-            color = VINYL_COLOR_BGR if id(roi) in flagged_ids else (0, 255, 0)
-            cv2.circle(source_disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), color, 2)
+            cv2.circle(source_disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), (0, 255, 0), 2)
         cv2.imwrite(os.path.join(SOURCE_DIR, f"source_{ts}_{barcode}.png"), source_disp)
 
         result_disp = source_disp.copy()
@@ -1060,12 +998,8 @@ class DustInspectorApp:
             cv2.putText(result_disp, b["label"], (cx + r + 10, cy + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3, cv2.LINE_AA)
             if b["type"] == "dust" and b.get("diameter_mm") is not None:
                 max_dia = max(max_dia or 0.0, b["diameter_mm"])
-        for h in vinyl_hits:
-            roi = h["roi"]
-            cx, cy, r = int(roi["cx"]), int(roi["cy"]), int(roi["r"])
-            cv2.putText(result_disp, "VINYL?", (cx - r, cy - r - 12), cv2.FONT_HERSHEY_SIMPLEX, 1.0, VINYL_COLOR_BGR, 3, cv2.LINE_AA)
 
-        verdict_dir = {"VINYL": RESULTS_VINYL_DIR, "FAIL": RESULTS_NG_DIR, "PASS": RESULTS_OK_DIR}[verdict]
+        verdict_dir = RESULTS_NG_DIR if verdict == "FAIL" else RESULTS_OK_DIR
         cv2.imwrite(os.path.join(verdict_dir, f"{verdict}_{ts}_{barcode}.png"), result_disp)
 
         model, line = self.settings.get("model_name"), self.settings.get("line_name")
@@ -1073,33 +1007,23 @@ class DustInspectorApp:
         log_args = (log_ts, barcode, model, line, verdict, len(blobs), max_dia)
         return verdict, log_args
 
-    def _build_findings_text(self, blobs, vinyl_hits):
-        if not blobs and not vinyl_hits:
+    def _build_findings_text(self, blobs):
+        if not blobs:
             return "No issues found"
-        lines = []
-        if vinyl_hits:
-            lines.append(f"- Vinyl film suspected ({len(vinyl_hits)} ROI)")
         counts = {}
         for b in blobs:
             counts[b["type"]] = counts.get(b["type"], 0) + 1
-        for t in ("dust", "thread", "glue"):
-            if counts.get(t):
-                lines.append(f"- {counts[t]}x {t}")
+        lines = [f"- {counts[t]}x {t}" for t in ("dust", "thread", "glue") if counts.get(t)]
         return "\n".join(lines)
 
-    def _finish_inspection(self, blobs, vinyl_hits, verdict, log_args):
+    def _finish_inspection(self, blobs, verdict, log_args):
         """Main-thread-only: updates widgets, including the log line (the
-        CSV row was already written on the background thread). The main
-        status badge only ever shows PASS/FAIL -- the specific defect
-        type(s) show in the Findings panel instead, and still get recorded
-        precisely in the log/filenames via `verdict`."""
+        CSV row was already written on the background thread)."""
         self.last_blobs = blobs
-        self.last_vinyl_hits = vinyl_hits
         self._append_log_line(*log_args)
-        display_verdict = "PASS" if verdict == "PASS" else "FAIL"
-        color = SUCCESS if display_verdict == "PASS" else DANGER
-        self._set_status(display_verdict, color)
-        self.findings_var.set(self._build_findings_text(blobs, vinyl_hits))
+        color = SUCCESS if verdict == "PASS" else DANGER
+        self._set_status(verdict, color)
+        self.findings_var.set(self._build_findings_text(blobs))
         self._render_main_feed()
         self.inspection_running = False
         self.start_btn.configure(text="Start Inspection", state="normal", fg_color=ACCENT)
@@ -1267,20 +1191,8 @@ class DustInspectorApp:
         binary, blobs, stats = run_zscore_detection(
             self.original, self.rois, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
             s.get("scale_mm_per_px"), s["min_diameter_mm"],
-            s["min_aspect_ratio"], s["max_thin_width_px"], s["max_arc_fit_residual"])
-        gray = cv2.cvtColor(self.original, cv2.COLOR_BGR2GRAY)
-        vinyl_hits = []
-        vinyl_per_roi = []  # every ROI's number, not just the ones that passed -- for diagnosing why some ROIs don't flag
-        for i, roi in enumerate(self.rois):
-            detected, info = detect_vinyl_presence(
-                gray, roi["cx"], roi["cy"], roi["r"],
-                tolerance_px=s.get("vinyl_tolerance_px", 15.0),
-                strength_ratio_thr=s.get("vinyl_strength_thr", 6.0))
-            vinyl_per_roi.append((i + 1, detected, info.get("strength_ratio", 0.0), info.get("peak_radius_px", 0)))
-            if detected:
-                vinyl_hits.append({"roi": roi, "info": info})
+            s["min_aspect_ratio"], s["max_thin_width_px"], s["max_arc_fit_residual"], s["gap_bridge_px"])
         self.last_blobs = blobs
-        self.last_vinyl_hits = vinyl_hits
         self._render_roi_canvas()
         self._render_main_feed()
 
@@ -1290,8 +1202,6 @@ class DustInspectorApp:
         msg = ", ".join(f"{n} {t}" for t, n in counts.items()) or "no defects"
         if stats:
             msg += f" | max_z={stats['max_z']:.2f} rejected={stats['rejected']}"
-        vinyl_txt = " ".join(f"ROI{n}={s_:.1f}{'*' if d else ''}@r{rp}" for n, d, s_, rp in vinyl_per_roi)
-        msg += f" | vinyl(strength@peak_radius): {vinyl_txt}"
         self.footer_var.set("Test detection: " + msg)
 
     # ---- calibration (shares ROI canvas clicks) -----------------------
@@ -1366,13 +1276,11 @@ class DustInspectorApp:
                      font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 8))
 
         row4 = ctk.CTkFrame(card, fg_color="transparent")
-        row4.pack(fill="x", padx=18, pady=(0, 18))
-        self.vinyl_tol_var = tk.StringVar(value=str(self.settings["vinyl_tolerance_px"]))
-        self.vinyl_thr_var = tk.StringVar(value=str(self.settings["vinyl_strength_thr"]))
-        self._field(row4, "Vinyl tolerance (px)", self.vinyl_tol_var, width=90).pack(side="left", padx=(0, 16))
-        self._field(row4, "Vinyl strength threshold", self.vinyl_thr_var, width=100).pack(side="left", padx=(0, 16))
+        row4.pack(fill="x", padx=18, pady=(0, 8))
+        self.gap_bridge_var = tk.StringVar(value=str(self.settings["gap_bridge_px"]))
+        self._field(row4, "Gap bridge (px)", self.gap_bridge_var, width=90).pack(side="left", padx=(0, 16))
         self._btn_primary(row4, "Save", self._save_detection_settings, width=100).pack(side="left", pady=(18, 0))
-        ctk.CTkLabel(card, text="Vinyl tolerance is a band on BOTH sides of the ROI radius (radius +/- this many px), not a one-directional offset. If the real cutout is genuinely far from your ROI center, a large value (its own real behavior, not an error) is fine and expected -- Test Detection shows peak_radius per ROI so you can confirm it's finding the actual cutout edge and not some other feature. The tradeoff: a wider band also raises the chance of latching onto an unrelated edge, so use the smallest tolerance that still reliably finds it.",
+        ctk.CTkLabel(card, text="A thread's contrast often isn't uniform along its length, so the raw threshold can split it into pieces. This bridges gaps up to this many px so a fragmented thread is measured as one continuous piece. Raise it if long threads still show only partly circled; too high can fuse separate nearby defects into one.",
                      font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 14))
 
     def _save_detection_settings(self):
@@ -1386,8 +1294,7 @@ class DustInspectorApp:
             self.settings["min_aspect_ratio"] = float(self.min_aspect_var.get())
             self.settings["max_thin_width_px"] = float(self.max_thin_var.get())
             self.settings["max_arc_fit_residual"] = float(self.arc_fit_var.get())
-            self.settings["vinyl_tolerance_px"] = float(self.vinyl_tol_var.get())
-            self.settings["vinyl_strength_thr"] = float(self.vinyl_thr_var.get())
+            self.settings["gap_bridge_px"] = float(self.gap_bridge_var.get())
         except ValueError:
             messagebox.showerror("Settings", "All fields must be numbers.")
             return
@@ -1566,12 +1473,7 @@ class DustInspectorApp:
     def _build_roi_canvas_disp(self):
         disp = self.original.copy()
         for i, roi in enumerate(self.rois):
-            if i == self.selected_idx:
-                color = (0, 255, 255)
-            elif self._is_vinyl_flagged(roi):
-                color = VINYL_COLOR_BGR
-            else:
-                color = (0, 255, 0)
+            color = (0, 255, 255) if i == self.selected_idx else (0, 255, 0)
             cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), color, 2)
             cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), 5, color, -1)
             cv2.putText(disp, str(i + 1), (int(roi["cx"]) + 10, int(roi["cy"]) - 10),
