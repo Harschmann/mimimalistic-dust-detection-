@@ -384,7 +384,8 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
     for lc in link_contours:
         region = np.zeros_like(raw)
         cv2.drawContours(region, [lc], -1, 255, -1)
-        original = cv2.bitwise_and(raw, region)  # true (undilated) pixels in this linked region
+        original = cv2.bitwise_and(raw, region)  # hysteresis-recovered pixels -- used for area/length
+        strong_part = cv2.bitwise_and(strong * 255, region)  # strong-only pixels -- used for shape/width/circularity
         area = int(cv2.countNonZero(original))
         if area < min_area:
             rejected += 1
@@ -395,12 +396,30 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
             rejected += 1
             continue
         perimeter = sum(cv2.arcLength(fc, True) for fc in frag_contours)
-        circularity = (4 * np.pi * area / (perimeter * perimeter)) if perimeter > 0 else 0.0
+        length_px = perimeter / 2.0
 
-        if circularity >= min_circularity and len(frag_contours) == 1:
+        # Shape decisions (round vs elongated, width) come from the STRONG
+        # core only, NOT the full hysteresis region. hysteresis's weak
+        # threshold is meant to extend LENGTH/continuity along a faint
+        # tail -- but any weak halo isn't perfectly symmetric or perfectly
+        # thread-width-shaped, so measuring width/circularity off the full
+        # (weak-included) region can inflate a genuinely thin thread's
+        # width past the glue cutoff, or make a genuinely round dust
+        # speck's circularity drop enough to look elongated. Confirmed
+        # with a direct test: a thin (4px) strong core measured 8.4px wide
+        # once its weak halo was included -- right at the glue threshold.
+        strong_contours, _ = cv2.findContours(strong_part, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        strong_area = int(cv2.countNonZero(strong_part))
+        if not strong_contours or strong_area < 1:
+            rejected += 1  # shouldn't normally happen -- a linked region always contains >=1 strong pixel
+            continue
+        strong_perimeter = sum(cv2.arcLength(sc, True) for sc in strong_contours)
+        circularity = (4 * np.pi * strong_area / (strong_perimeter * strong_perimeter)) if strong_perimeter > 0 else 0.0
+
+        if circularity >= min_circularity and len(strong_contours) == 1:
             # only a genuinely solid single blob counts as dust -- a linked
             # group of several small fragments is never one dust speck
-            (cx, cy), r = cv2.minEnclosingCircle(frag_contours[0])
+            (cx, cy), r = cv2.minEnclosingCircle(strong_contours[0])
             diameter_px = 2.0 * r
             diameter_mm = diameter_px * mm_per_px if mm_per_px else None
             if diameter_mm is not None and diameter_mm < min_diameter_mm:
@@ -412,10 +431,10 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
             binary = cv2.bitwise_or(binary, original)
             continue
 
-        # not round -- is it a real elongated shape at all?
-        dist = cv2.distanceTransform(original, cv2.DIST_L2, 5)
+        # not round -- is it a real elongated shape at all? width from the
+        # strong core only, for the same reason as circularity above.
+        dist = cv2.distanceTransform(strong_part, cv2.DIST_L2, 5)
         width_px = 2.0 * float(dist.max())
-        length_px = perimeter / 2.0
         if length_px < 1e-6 or (length_px / max(width_px, 1e-6)) < min_aspect_ratio:
             rejected += 1
             continue  # neither round nor elongated enough -- ambiguous, drop
