@@ -83,8 +83,6 @@ BLOB_COLOR_BGR = {
     "dust": (0, 0, 255),      # red
     "thread": (0, 165, 255),  # amber
     "glue": (255, 0, 255),    # magenta
-    "scratch": (255, 255, 0), # cyan
-    "pit": (255, 128, 0),     # azure blue
 }
 VINYL_COLOR_BGR = (245, 85, 168)  # pink-purple, kept distinct from glue's magenta
 
@@ -128,15 +126,6 @@ DEFAULT_SETTINGS = {
     "z_thr_low": 1.5,
     "vinyl_tolerance_px": 15.0,
     "vinyl_strength_thr": 6.0,
-    "classify_scratch": True,
-    "max_scratch_straightness": 0.06,
-    "min_scratch_length_px": 20.0,
-    "max_scratch_width_cv": 0.35,
-    "pit_enabled": True,
-    "pit_intensity_thresh": 20,
-    "pit_min_area_px": 4.0,
-    "pit_kernel_small": 11,
-    "pit_kernel_large": 19,
     "model_name": "",
     "line_name": "",
     "active_roi_name": None,
@@ -287,92 +276,10 @@ def _fit_circle(pts):
     return float(r), resid
 
 
-def _fit_line_residual(pts):
-    """Least-squares straight-line fit (cv2.fitLine) through a set of 2D
-    points. Returns the RMS perpendicular distance of the points from
-    that best-fit line -- 0 means the points are perfectly straight,
-    larger means they bend/curve away from any single straight line.
-
-    This is the straight-line counterpart to _fit_circle above, and is
-    used the same way: fit_circle asks "does this shape trace a large
-    fixed circle" (to catch lens/coating reflection arcs); this asks
-    "does this shape track a straight line" (to tell a scratch groove --
-    which is straight by nature, being a mark on a flat surface -- apart
-    from a thread/fiber, which is free to bend into any curve since it's
-    a loose object sitting on top of the module, not a mark cut into it).
-    """
-    pts32 = pts.astype(np.float32).reshape(-1, 1, 2)
-    vx, vy, x0, y0 = cv2.fitLine(pts32, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
-    dx = pts[:, 0] - x0
-    dy = pts[:, 1] - y0
-    perp_dist = np.abs(dx * vy - dy * vx)  # (vx, vy) is a unit vector, so this is exact
-    return float(np.sqrt(np.mean(perp_dist ** 2)))
-
-
-def _width_uniformity_cv(strong_part, dist, all_pts, n_bins=8):
-    """Coefficient of variation (std/mean) of the blob's width, sampled
-    at n_bins positions along its major (PCA) axis, using the same
-    distance-transform already computed for the overall width measure.
-
-    This is a SECOND, physically independent signal from straightness,
-    used together with it (both must agree) to call something a scratch:
-    a mechanical groove tends to hold a fairly CONSTANT width along its
-    length, while a thread/fiber's width tends to VARY along its length
-    (it twists, overlaps itself, frays and tapers at the ends). Relying
-    on straightness alone is fragile -- a short, only mildly-curved
-    thread fragment can look "straight enough" over a short visible
-    length purely because there wasn't enough length for its curvature
-    to show up in a line-fit residual. Width variation is a shape cue
-    that doesn't depend on the fragment being long enough to curve.
-
-    Returns 0.0 (i.e. "uniform", non-disqualifying) when there isn't
-    enough length/pixels to sample width reliably -- a blob that's too
-    short to assess width variation shouldn't be penalized for it; the
-    length gate (min_scratch_length_px) is what should exclude it.
-    """
-    ys, xs = np.nonzero(strong_part)
-    if xs.size < n_bins * 2:
-        return 0.0
-    mean_pt = all_pts.mean(axis=0)
-    centered = all_pts - mean_pt
-    cov = centered.T @ centered / max(len(centered), 1)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    axis_dir = eigvecs[:, int(np.argmax(eigvals))]
-    axis_dir = axis_dir / (np.linalg.norm(axis_dir) + 1e-9)
-
-    px_pts = np.stack([xs, ys], axis=1).astype(np.float64)
-    proj = (px_pts - mean_pt) @ axis_dir
-    lo, hi = float(proj.min()), float(proj.max())
-    if hi - lo < 1e-6:
-        return 0.0
-    edges = np.linspace(lo, hi, n_bins + 1)
-    bin_widths = []
-    for i in range(n_bins):
-        if i < n_bins - 1:
-            sel = (proj >= edges[i]) & (proj < edges[i + 1])
-        else:
-            sel = (proj >= edges[i]) & (proj <= edges[i + 1])
-        if not np.any(sel):
-            continue
-        local = dist[ys[sel], xs[sel]] * 2.0
-        if local.size:
-            bin_widths.append(float(local.max()))
-    if len(bin_widths) < 3:
-        return 0.0
-    w = np.array(bin_widths)
-    mean_w = float(w.mean())
-    if mean_w < 1e-6:
-        return 0.0
-    return float(w.std() / mean_w)
-
-
-
 def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity=0.55,
                           mm_per_px=None, min_diameter_mm=0.0,
                           min_aspect_ratio=3.0, max_thin_width_px=8.0, max_arc_fit_residual=0.12,
-                          gap_bridge_px=7.0, z_thr_low=1.5, classify_scratch=True,
-                          max_scratch_straightness=0.06, min_scratch_length_px=20.0,
-                          max_scratch_width_cv=0.35, debug=False):
+                          gap_bridge_px=7.0, z_thr_low=1.5, debug=False):
     """Core Z-score math is UNCHANGED: local Z-score via boxFilter mean/std,
     thresholded inside the union of all circular ROI masks.
 
@@ -398,40 +305,18 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
     and that's what's tested here, on the actual contour points -- not on
     a straight bounding-box proxy, which breaks down for curved shapes.
 
-    A second, separate shape test then splits what's left (thin,
-    elongated, NOT a lens/reflection arc) into SCRATCH vs THREAD, using
-    TWO independent physical cues that both have to agree -- straightness
-    alone turned out to be too fragile on its own:
-      1. Straightness: a scratch is a groove cut into a flat surface, so
-         it is straight by construction; a thread is a loose fiber, free
-         to bend into any curve. Fitting a straight line (not a circle)
-         to the contour points and checking the residual (_fit_line_residual)
-         answers this -- but ONLY over the fragment actually visible in
-         this ROI, which is a real limitation: a short thread segment
-         that simply hasn't curved much within its visible length will
-         also score as "straight", so straightness alone was
-         over-labeling real thread as scratch.
-      2. Width uniformity: independently of curvature, a groove holds a
-         fairly CONSTANT width along its length, while a fiber's width
-         VARIES (it twists, overlaps itself, tapers at the ends). This is
-         measured by _width_uniformity_cv, sampling width along the
-         blob's major axis via the same distance-transform already used
-         for the overall width measurement.
-    A blob is only called scratch if it clears a minimum length
-    (min_scratch_length_px -- too short to trust either cue, so it
-    defaults to thread), AND is straight enough (max_scratch_straightness),
-    AND its width stays uniform enough (max_scratch_width_cv). Any one
-    cue failing keeps it labeled thread.
-
-    This reuses the same z-score/hysteresis/gap-bridging pipeline and the
-    same arc-rejection as dust/thread/glue, rather than a separate
-    detector on a different signal (e.g. image gradients) -- a prior
-    anisotropy+Hough-line approach was tried and dropped because it fired
-    on any strong directional edge in the ROI (traces, contacts,
-    silkscreen, the module's own boundary), not just genuine scratches,
-    and its threshold was frame-relative (min-max normalized per image)
-    so it drifted with lighting/exposure instead of measuring anything
-    absolute.
+    A separate SCRATCH category (split from thread by straightness, then
+    later by straightness + width-uniformity) and a PITTING detector were
+    both tried and then removed: on real module images they produced more
+    wrong labels than right ones -- straightness/width shape cues alone
+    couldn't reliably tell a short, only-mildly-curved thread fragment
+    from a genuine scratch, and the pitting detector kept firing on
+    ordinary module features. Every thin/elongated/non-arc blob is
+    labeled thread, covering the full range that's actually shown up:
+    thin single-strand fiber, slightly thicker strands, and any amount of
+    curl/curve down to nearly straight for a short fragment -- shape
+    alone doesn't reliably separate "thread" from "scratch" at this
+    stage, so no attempt is made to split it further here.
 
     This replaced an earlier blanket morphological opening: that approach
     reliably erased thin curved lens/reflection arcs, but it also erased
@@ -587,15 +472,7 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
                 rejected += 1
                 continue  # a clean fit to one circle much bigger than itself -- a real
                           # optical reflection/rim (fixed lens geometry), not contamination
-
             btype = "thread"
-            if classify_scratch and len(all_pts) >= 4 and length_px >= min_scratch_length_px:
-                line_resid = _fit_line_residual(all_pts)
-                line_straightness = line_resid / max(length_px, 1e-6)
-                if line_straightness <= max_scratch_straightness:
-                    width_cv = _width_uniformity_cv(strong_part, dist, all_pts)
-                    if width_cv <= max_scratch_width_cv:
-                        btype = "scratch"
 
         if mm_per_px:
             label = f"{btype} {length_px * mm_per_px:.2f}x{width_px * mm_per_px:.2f}mm"
@@ -633,156 +510,6 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
         debug_images["7 Final classified result"] = result_disp
 
     return binary, blobs, stats, debug_images
-
-
-
-def detect_pitting(gray, roi_mask, kernel_sizes=(11, 19), intensity_thresh=20.0, min_area=4.0):
-    """Finds small bright/dark pit-like features (craters, pinholes) via
-    multi-scale morphological top-hat + black-hat (ported from the same
-    lens-inspection prototype), restricted to roi_mask.
-
-    Top-hat pulls out small BRIGHT spots against a locally darker
-    background; black-hat pulls out small DARK spots against a locally
-    brighter background -- combining both catches pits regardless of
-    whether they read bright or dark under the current lighting.
-
-    Combined across kernel_sizes via a per-pixel MAXIMUM, not a sum:
-    each kernel size is a different length-scale probe, and a true pit
-    matches ONE of them most closely (top-hat/black-hat response peaks
-    when the kernel roughly matches feature size); taking the max keeps
-    the result in real 0-255 gray-level units (a pit's actual brightness
-    difference from its local background) and picks the best-matching
-    scale per pixel, the same idea as taking a local maximum across
-    scale-space in a proper multi-scale blob detector. Summing instead
-    (the original version of this function) inflates the response for
-    ordinary texture that responds moderately at BOTH scales even though
-    no single scale shows a real pit -- a source of false positives.
-
-    IMPORTANT: intensity_thresh is applied directly to this raw,
-    real-units response -- there is no per-frame min-max normalization
-    step. An earlier version stretched the combined response to 0-255 by
-    its own min/max before thresholding, which is exactly the same
-    frame-relative bug that broke the original scratch detector: the
-    "255" was whatever pixel happened to have the strongest top-hat/
-    black-hat response in THIS SPECIFIC FRAME, so the same physical pit
-    (or the same background texture) could sit above or below threshold
-    purely because of what else was in the ROI, or the current lighting/
-    exposure -- not because the pit itself changed. Top-hat/black-hat
-    output is already in true intensity units (how many gray levels
-    brighter/darker than the local morphological baseline), so
-    thresholding it directly is an absolute, frame-independent cutoff.
-
-    A small opening removes single-pixel sensor-noise specks before
-    contour extraction, since raw per-pixel absolute thresholding (unlike
-    the Z-score pipeline's hysteresis) has no built-in noise rejection.
-
-    Returns (blobs, response_map) -- blobs is a list of {"type": "pit",
-    ...} dicts; response_map is the raw 0-255 combined response (for the
-    pipeline debug viewer), NOT masked to the ROI, and already in the
-    same real units used for detection (no separate normalization).
-    """
-    gray_u8 = gray if gray.dtype == np.uint8 else np.clip(gray, 0, 255).astype(np.uint8)
-    response = None
-    for ks in kernel_sizes:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(ks), int(ks)))
-        tophat = cv2.morphologyEx(gray_u8, cv2.MORPH_TOPHAT, k)
-        blackhat = cv2.morphologyEx(gray_u8, cv2.MORPH_BLACKHAT, k)
-        scale_resp = np.maximum(tophat, blackhat)
-        response = scale_resp if response is None else np.maximum(response, scale_resp)
-    response_map = response if response is not None else np.zeros_like(gray_u8)
-
-    resp_roi = cv2.bitwise_and(response_map, response_map, mask=roi_mask)
-    _, pb = cv2.threshold(resp_roi, int(round(intensity_thresh)), 255, cv2.THRESH_BINARY)
-    noise_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    pb = cv2.morphologyEx(pb, cv2.MORPH_OPEN, noise_kernel)
-    contours, _ = cv2.findContours(pb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    blobs = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < min_area:
-            continue
-        (cx, cy), r = cv2.minEnclosingCircle(c)
-        blobs.append({"type": "pit", "cx": float(cx), "cy": float(cy),
-                      "r": float(max(r, 3.0)), "area_px": float(area),
-                      "label": f"pit {area:.0f}px2"})
-    return blobs, response_map
-
-
-def run_full_detection(bgr, rois, settings, debug=False):
-    """Combines this app's Z-score classifier (now covering dust, thread,
-    glue, AND scratch -- scratch is classified by straight-line fit
-    inside run_zscore_detection itself, see its docstring) with one
-    additional detector ported from a separate lens-inspection prototype:
-    pitting detection (multi-scale top-hat/black-hat). Both run inside
-    the SAME calibrated ROI masks set up in Teaching -- the prototype's
-    own round-lens ROI auto-detection (Hough circles for a concentric
-    lens barrel) was deliberately NOT ported, since these are flat camera
-    modules with manually placed/calibrated ROIs, not a circular lens
-    dome.
-
-    (An earlier version of scratch detection ran as a fully separate
-    anisotropy+Hough-line detector here. It was retired: it fired on any
-    strong directional edge in the ROI -- traces, contacts, silkscreen,
-    the module's own boundary -- not just genuine scratches, and its
-    threshold was frame-relative so it drifted with lighting/exposure.
-    Scratch is now just another shape branch of the existing, already-
-    validated dust/thread/glue pipeline.)
-
-    Returns (blobs, stats, debug_images) -- blobs is the merged list
-    (same dict shape as run_zscore_detection's blobs, each with
-    "type"/"cx"/"cy"/"r"/"label"); stats augments the Z-score stats dict
-    with scratch_count/pit_count/total_count; and debug_images (only
-    when debug=True) extends the Z-score pipeline debug dict with the
-    pitting map and a final combined result image drawing all defect
-    types together.
-    """
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-
-    _binary, blobs, stats, dbg = run_zscore_detection(
-        bgr, rois, settings["window"], settings["z_thr"], settings["min_area"],
-        settings["min_circularity"], settings.get("scale_mm_per_px"), settings["min_diameter_mm"],
-        settings["min_aspect_ratio"], settings["max_thin_width_px"], settings["max_arc_fit_residual"],
-        settings["gap_bridge_px"], settings["z_thr_low"],
-        classify_scratch=settings.get("classify_scratch", True),
-        max_scratch_straightness=settings.get("max_scratch_straightness", 0.06),
-        min_scratch_length_px=settings.get("min_scratch_length_px", 20.0),
-        max_scratch_width_cv=settings.get("max_scratch_width_cv", 0.35),
-        debug=debug)
-
-    roi_mask = np.zeros(gray.shape, dtype=np.uint8)
-    for roi in rois:
-        cv2.circle(roi_mask, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), 255, -1)
-
-    pit_blobs, pit_map = [], None
-    if settings.get("pit_enabled", True):
-        pit_blobs, pit_map = detect_pitting(
-            gray, roi_mask,
-            kernel_sizes=(settings.get("pit_kernel_small", 11), settings.get("pit_kernel_large", 19)),
-            intensity_thresh=settings.get("pit_intensity_thresh", 20.0),
-            min_area=settings.get("pit_min_area_px", 4.0))
-
-    all_blobs = blobs + pit_blobs
-
-    if stats is not None:
-        stats["scratch_count"] = sum(1 for b in blobs if b["type"] == "scratch")
-        stats["pit_count"] = len(pit_blobs)
-        stats["total_count"] = len(all_blobs)
-
-    debug_images = None
-    if debug:
-        debug_images = dbg if dbg is not None else {}
-        if pit_map is not None:
-            debug_images["8 Pitting top-hat/black-hat map"] = cv2.applyColorMap(pit_map, cv2.COLORMAP_INFERNO)
-        result_disp = bgr.copy()
-        for b in all_blobs:
-            cx, cy, r = int(b["cx"]), int(b["cy"]), int(round(b["r"]))
-            color = BLOB_COLOR_BGR.get(b["type"], (0, 0, 255))
-            cv2.circle(result_disp, (cx, cy), r + 4, color, 2)
-            cv2.putText(result_disp, b["label"], (cx + r + 10, cy + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3, cv2.LINE_AA)
-        debug_images["9 Final combined result (all defect types)"] = result_disp
-
-    return all_blobs, stats, debug_images
 
 
 
@@ -1538,7 +1265,10 @@ class DustInspectorApp:
         """
         s = self.settings
         try:
-            blobs, _stats, _dbg = run_full_detection(frame, rois_snapshot, s, debug=False)
+            _binary, blobs, _stats, _dbg = run_zscore_detection(
+                frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
+                s.get("scale_mm_per_px"), s["min_diameter_mm"],
+                s["min_aspect_ratio"], s["max_thin_width_px"], s["max_arc_fit_residual"], s["gap_bridge_px"], s["z_thr_low"])
         except Exception:
             blobs = []
 
@@ -1583,7 +1313,7 @@ class DustInspectorApp:
         counts = {}
         for b in blobs:
             counts[b["type"]] = counts.get(b["type"], 0) + 1
-        lines = [f"- {counts[t]}x {t}" for t in ("dust", "thread", "glue", "scratch", "pit") if counts.get(t)]
+        lines = [f"- {counts[t]}x {t}" for t in ("dust", "thread", "glue") if counts.get(t)]
         return "\n".join(lines)
 
     def _finish_inspection(self, blobs, verdict, log_args):
@@ -1793,7 +1523,10 @@ class DustInspectorApp:
         must never be able to freeze the UI, no matter what's dialed in."""
         s = self.settings
         try:
-            blobs, stats, _dbg = run_full_detection(frame, rois_snapshot, s, debug=False)
+            _binary, blobs, stats, _dbg = run_zscore_detection(
+                frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
+                s.get("scale_mm_per_px"), s["min_diameter_mm"],
+                s["min_aspect_ratio"], s["max_thin_width_px"], s["max_arc_fit_residual"], s["gap_bridge_px"], s["z_thr_low"])
         except Exception:
             blobs, stats = [], None
         self.root.after(0, lambda: self._finish_test_detection(blobs, stats))
@@ -1822,7 +1555,11 @@ class DustInspectorApp:
     def _run_pipeline_debug_thread(self, frame, rois_snapshot):
         s = self.settings
         try:
-            _blobs, _stats, debug_images = run_full_detection(frame, rois_snapshot, s, debug=True)
+            _binary, _blobs, _stats, debug_images = run_zscore_detection(
+                frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
+                s.get("scale_mm_per_px"), s["min_diameter_mm"],
+                s["min_aspect_ratio"], s["max_thin_width_px"], s["max_arc_fit_residual"], s["gap_bridge_px"], s["z_thr_low"],
+                debug=True)
         except Exception:
             debug_images = None
         self.root.after(0, lambda: self._finish_pipeline_debug(debug_images))
@@ -1901,24 +1638,10 @@ class DustInspectorApp:
         self.min_aspect_var = tk.StringVar(value=str(self.settings["min_aspect_ratio"]))
         self.max_thin_var = tk.StringVar(value=str(self.settings["max_thin_width_px"]))
         self.arc_fit_var = tk.StringVar(value=str(self.settings["max_arc_fit_residual"]))
-        self.scratch_straight_var = tk.StringVar(value=str(self.settings.get("max_scratch_straightness", 0.06)))
         self._field(row3, "Min elongation ratio", self.min_aspect_var, width=90).pack(side="left", padx=(0, 16))
         self._field(row3, "Max thread/arc width (px)", self.max_thin_var, width=110).pack(side="left", padx=(0, 16))
         self._field(row3, "Arc-fit tolerance (0-1)", self.arc_fit_var, width=100).pack(side="left", padx=(0, 16))
-        self._field(row3, "Scratch straightness (0-1)", self.scratch_straight_var, width=110).pack(side="left", padx=(0, 16))
-        self.scratch_classify_var = tk.BooleanVar(value=self.settings.get("classify_scratch", True))
-        ctk.CTkSwitch(row3, text="Classify scratch", variable=self.scratch_classify_var,
-                      onvalue=True, offvalue=False, font=self.f_small).pack(side="left", padx=(4, 0), pady=(18, 0))
         ctk.CTkLabel(card, text="A thin elongated blob is rejected as an arc (lens/coating reflection) only if it cleanly fits ONE circle much bigger than itself -- a real thread can curve too, but essentially never traces a perfect large arc, so curvature alone no longer disqualifies it. Lower the tolerance to be stricter about what counts as a clean circle fit.",
-                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 8))
-
-        row3b = ctk.CTkFrame(card, fg_color="transparent")
-        row3b.pack(fill="x", padx=18, pady=(0, 8))
-        self.scratch_minlen_var = tk.StringVar(value=str(self.settings.get("min_scratch_length_px", 20.0)))
-        self.scratch_widthcv_var = tk.StringVar(value=str(self.settings.get("max_scratch_width_cv", 0.35)))
-        self._field(row3b, "Min scratch length (px)", self.scratch_minlen_var, width=110).pack(side="left", padx=(0, 16))
-        self._field(row3b, "Max scratch width CV (0-1)", self.scratch_widthcv_var, width=120).pack(side="left", padx=(0, 16))
-        ctk.CTkLabel(card, text="Of what's left (thin, elongated, not an arc), SCRATCH requires BOTH straightness AND a fairly constant width along its length -- a groove holds its width, a fiber's width varies as it twists/overlaps/tapers. Anything shorter than the minimum length defaults to thread (too short to trust either measurement). Raise straightness or width-CV tolerance to call more of these scratch; lower them to call more thread. Turn off \"Classify scratch\" to fall back to labeling all of these as thread, as before.",
                      font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 8))
 
         row4 = ctk.CTkFrame(card, fg_color="transparent")
@@ -1930,30 +1653,6 @@ class DustInspectorApp:
         self._btn_primary(row4, "Save", self._save_detection_settings, width=100).pack(side="left", pady=(18, 0))
         ctk.CTkLabel(card, text="Two different fixes for a broken-up thread: Weak threshold recovers a FAINT tail that's still elevated in the z-score but below the main threshold (hysteresis: a weak pixel counts if it touches a strong one, same trick Canny edge detection uses). Gap bridge instead links pieces separated by a true GAP with no signal at all -- it can't invent detail hysteresis is the fix when the heatmap actually shows the thread, just not brightly enough everywhere; gap bridge is the fix when there's a real empty stretch in between.",
                      font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 14))
-
-        # ---- pitting detection (multi-scale top-hat/black-hat) ----
-        pit_card = self._card(tab)
-        pit_card.pack(fill="x", padx=20, pady=(0, 20))
-        phead = ctk.CTkFrame(pit_card, fg_color="transparent")
-        phead.pack(fill="x", padx=18, pady=(16, 6))
-        ctk.CTkLabel(phead, text="Pitting Detection", font=self.f_section, text_color=TEXT).pack(side="left")
-        self.pit_enabled_var = tk.BooleanVar(value=self.settings.get("pit_enabled", True))
-        ctk.CTkSwitch(phead, text="Enabled", variable=self.pit_enabled_var,
-                      onvalue=True, offvalue=False, font=self.f_small).pack(side="right")
-        row6 = ctk.CTkFrame(pit_card, fg_color="transparent")
-        row6.pack(fill="x", padx=18, pady=(0, 8))
-        self.pit_thresh_var = tk.StringVar(value=str(self.settings.get("pit_intensity_thresh", 20.0)))
-        self.pit_minarea_var = tk.StringVar(value=str(self.settings.get("pit_min_area_px", 4.0)))
-        self.pit_ksmall_var = tk.StringVar(value=str(self.settings.get("pit_kernel_small", 11)))
-        self.pit_klarge_var = tk.StringVar(value=str(self.settings.get("pit_kernel_large", 19)))
-        self._field(row6, "Intensity threshold (gray levels)", self.pit_thresh_var, width=150).pack(side="left", padx=(0, 16))
-        self._field(row6, "Min pit area (px^2)", self.pit_minarea_var, width=100).pack(side="left", padx=(0, 16))
-        self._field(row6, "Small kernel (px)", self.pit_ksmall_var, width=90).pack(side="left", padx=(0, 16))
-        self._field(row6, "Large kernel (px)", self.pit_klarge_var, width=90).pack(side="left", padx=(0, 16))
-        ctk.CTkLabel(pit_card, text="Finds small bright or dark craters/pinholes: at each pixel, how many gray levels it differs from its own local morphological background, at whichever of the two kernel sizes responds strongest. This is an ABSOLUTE threshold (real gray-level units, not a per-frame normalized percentage) so it stays consistent across frames/lighting. Lower it to catch shallower pits (more false positives from ordinary surface texture); raise it if flat, feature-free areas of the module are triggering false pits.",
-                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 8))
-        self._btn_primary(pit_card, "Save All Detection Settings", self._save_detection_settings, width=220).pack(
-            anchor="w", padx=18, pady=(0, 16))
 
     def _save_detection_settings(self):
         try:
@@ -1968,15 +1667,6 @@ class DustInspectorApp:
             self.settings["max_arc_fit_residual"] = float(self.arc_fit_var.get())
             self.settings["gap_bridge_px"] = float(self.gap_bridge_var.get())
             self.settings["z_thr_low"] = float(self.z_thr_low_var.get())
-            self.settings["classify_scratch"] = bool(self.scratch_classify_var.get())
-            self.settings["max_scratch_straightness"] = float(self.scratch_straight_var.get())
-            self.settings["min_scratch_length_px"] = float(self.scratch_minlen_var.get())
-            self.settings["max_scratch_width_cv"] = float(self.scratch_widthcv_var.get())
-            self.settings["pit_enabled"] = bool(self.pit_enabled_var.get())
-            self.settings["pit_intensity_thresh"] = float(self.pit_thresh_var.get())
-            self.settings["pit_min_area_px"] = float(self.pit_minarea_var.get())
-            self.settings["pit_kernel_small"] = int(self.pit_ksmall_var.get())
-            self.settings["pit_kernel_large"] = int(self.pit_klarge_var.get())
         except ValueError:
             messagebox.showerror("Settings", "All fields must be numbers.")
             return
