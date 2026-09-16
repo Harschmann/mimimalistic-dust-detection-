@@ -1,53 +1,47 @@
 """
 Training Studio -- standalone anomaly-detection model trainer
 ----------------------------------------------------------------
-This is DELIBERATELY a separate tool from dust_inspector_app.py (the
-production/operator app). Reasons:
+Separate tool from dust_inspector_app.py (the production/operator app) --
+see the original design note below the imports for why.
 
-  - Training needs PyTorch + anomalib, which pull in ~1-2GB of
-    dependencies (more with CUDA). The operator's factory-floor PC should
-    stay light and fast-launching; it doesn't need any of this.
-  - Different users: the operator just presses Start every day. Training
-    is something you (or an engineer) run occasionally, on your own
-    machine, when you want to add/improve a model.
-  - Stability: the production inspection app should stay rock solid.
-    Experimental training code living in the same process is a needless
-    risk to that.
+ARCHITECTURE (why it's built this way):
 
-What this does:
-  1. Pick a model: PatchCore, PaDiM, or EfficientAd (all via anomalib --
-    we don't reimplement them).
-  2. Point it at your existing storage/results/OK (good images -- this is
-    the training set; these models train on NORMAL images only, no
-    labeling needed) and storage/results/NG (defect images -- used only
-    for validation/testing, to measure how well it separates good from
-    bad).
-  3. Train (runs on a background thread; PatchCore/PaDiM don't need a GPU,
-    EfficientAd is much faster WITH one but can run on CPU too, just slower).
-  4. See validation metrics (image-level AUROC, and a recommended anomaly
-    score threshold) plus a couple of example heatmaps.
-  5. Export the trained model to ONNX.
+  - AnomalyModelPlugin (abstract base) + MODEL_REGISTRY: every supported
+    model (PatchCore, PaDiM, EfficientAd, ...) is a small self-contained
+    class implementing one method (`build()`). The UI and the training
+    job both iterate MODEL_REGISTRY generically -- neither has an
+    if/elif chain naming specific models. Adding a new model later means
+    writing ONE new plugin class and one `register_model(...)` call;
+    nothing else in the file changes. This is the Open/Closed Principle:
+    open for extension (new plugins), closed for modification (existing
+    code doesn't need editing).
 
-Then in dust_inspector_app.py (Teaching > a future "Anomaly Model" field),
-you point at that exported .onnx file. Inference there only needs
-`onnxruntime`, NOT torch/anomalib -- a couple MB dependency instead of a
-couple GB. The resulting anomaly heatmap feeds into the SAME shape
-classifier (circularity / aspect ratio / circle-fit / distance-transform
-width) already in the production app, so dust/thread/glue categorization
-doesn't change -- this only replaces how *candidate regions* get found in
-the first place, as a complement to (not a replacement for) the existing
-Z-score detector.
+  - ProfileManager: owns "which phone model (S26, A36, ...) does this
+    training run belong to, and where does it live on disk". The UI and
+    the training job both go through this instead of building paths
+    themselves -- if you ever change how runs are organized on disk, it's
+    a one-class change.
+
+  - run_training_job(): pure background-thread function, knows nothing
+    about Tkinter. Takes a profile + a plugin + folders, reports progress
+    via a callback, and returns a result dict. Testable on its own,
+    independent of the GUI.
+
+  - TrainingStudioApp: the GUI. Only this part touches Tkinter/customtkinter.
 
 REQUIRES (on the machine you run this on, not the operator's PC):
     pip install anomalib torch torchvision
 
 This was written against anomalib's current (Lightning Engine-based) API.
-It has NOT been execution-tested in the environment that generated it --
-that environment couldn't install the ~2GB torch/anomalib stack (disk
-space) or reach PyTorch's CPU-wheel index (network egress). Please pip
-install on your own machine and try it; if you hit an error, send me the
-exact traceback and I'll fix it against the anomalib version you actually
-have (the Folder/Engine API has shifted across anomalib versions).
+It has NOT been execution-tested against a real anomalib install -- the
+environment that generated it couldn't install the ~2GB torch/anomalib
+stack (disk space) or reach PyTorch's CPU-wheel index (network egress).
+The GUI code WAS exercised end-to-end against stubbed Tkinter/customtkinter
+modules (catches structural/logic bugs), but that can't verify real
+customtkinter widget API compliance or the actual anomalib training path.
+Please pip install on your own machine and try it; if you hit an error,
+send me the exact traceback and I'll fix it against the anomalib version
+you actually have (the Folder/Engine API has shifted across versions).
 
 Run:  python training_studio.py
 """
@@ -57,12 +51,14 @@ import sys
 import io
 import json
 import base64
+import shutil
 import threading
 import traceback
+from abc import ABC, abstractmethod
 from datetime import datetime
 
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 import customtkinter as ctk
 from PIL import Image
 
@@ -89,80 +85,339 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKDIR = os.path.join(BASE_DIR, "training_runs")
 os.makedirs(WORKDIR, exist_ok=True)
 
-MODEL_CHOICES = {
-    "PatchCore": {
-        "icon": "layers_white",
-        "desc": "No backprop training -- extracts features with a pretrained CNN and "
-                "builds a coreset memory bank. Runs fine on CPU. Good default.",
-        "needs_gpu_for_speed": False,
-    },
-    "PaDiM": {
-        "icon": "cpu_white",
-        "desc": "Similar idea (pretrained-feature + statistical model), lighter "
-                "memory footprint, slightly lower accuracy typically. CPU-friendly.",
-        "needs_gpu_for_speed": False,
-    },
-    "EfficientAd": {
-        "icon": "zap_white",
-        "desc": "Actual small-network training (student-teacher distillation). Much "
-                "faster inference (sub-5ms on GPU) -- training itself is far faster "
-                "with a GPU too, but works on CPU, just slower.",
-        "needs_gpu_for_speed": True,
-    },
-}
+
+# ============================================================ MODEL PLUGINS
+# Adding a new model = write one class below + one register_model() call.
+# Nothing else in this file needs to change.
+class AnomalyModelPlugin(ABC):
+    key = ""
+    display_name = ""
+    icon = "cpu_white"
+    description = ""
+    needs_gpu_for_speed = False
+
+    @abstractmethod
+    def build(self):
+        """Returns a freshly constructed anomalib model instance. Imports
+        are local to each plugin's build() so the app can still open (and
+        show every plugin in the picker) even before anomalib is
+        installed -- the actual import error only surfaces when you
+        press Start Training with that plugin selected."""
+        raise NotImplementedError
 
 
-def _build_anomalib_model(name):
-    """Constructs the chosen anomalib model. Import is local to this
-    function so the rest of the app (and the file's import time) doesn't
-    hard-fail if anomalib isn't installed yet -- the GUI can still open
-    and show a clear message when Train is actually pressed."""
-    if name == "PatchCore":
+class PatchCorePlugin(AnomalyModelPlugin):
+    key = "PatchCore"
+    display_name = "PatchCore"
+    icon = "layers_white"
+    description = ("No backprop training -- extracts features with a pretrained CNN and "
+                    "builds a coreset memory bank. Runs fine on CPU. Good default.")
+    needs_gpu_for_speed = False
+
+    def build(self):
         from anomalib.models import Patchcore
         return Patchcore()
-    elif name == "PaDiM":
+
+
+class PaDiMPlugin(AnomalyModelPlugin):
+    key = "PaDiM"
+    display_name = "PaDiM"
+    icon = "cpu_white"
+    description = ("Similar idea (pretrained-feature + statistical model), lighter "
+                    "memory footprint, slightly lower accuracy typically. CPU-friendly.")
+    needs_gpu_for_speed = False
+
+    def build(self):
         from anomalib.models import Padim
         return Padim()
-    elif name == "EfficientAd":
+
+
+class EfficientAdPlugin(AnomalyModelPlugin):
+    key = "EfficientAd"
+    display_name = "EfficientAd"
+    icon = "zap_white"
+    description = ("Actual small-network training (student-teacher distillation). Much "
+                    "faster inference (sub-5ms on GPU) -- training itself is far faster "
+                    "with a GPU too, but works on CPU, just slower.")
+    needs_gpu_for_speed = True
+
+    def build(self):
         from anomalib.models import EfficientAd
         return EfficientAd()
-    raise ValueError(f"Unknown model: {name}")
 
 
-def run_training_job(good_dir, defect_dir, model_name, max_epochs, progress_cb, done_cb):
-    """Runs entirely on a background thread. progress_cb(str) is called
-    with human-readable status lines; done_cb(result_dict_or_None, error_str_or_None)
-    is called exactly once at the end (success or failure)."""
+MODEL_REGISTRY = {}
+
+
+def register_model(plugin_cls):
+    instance = plugin_cls()
+    MODEL_REGISTRY[instance.key] = instance
+    return plugin_cls
+
+
+register_model(PatchCorePlugin)
+register_model(PaDiMPlugin)
+register_model(EfficientAdPlugin)
+
+
+# =========================================================== PROFILE MANAGER
+class ProfileManager:
+    """Owns where a given phone-model's (S26, A36, ...) training runs live
+    on disk, and which run is marked 'active' for that profile (i.e. the
+    one you'd point the production app's ONNX loader at). Nothing else in
+    this file builds these paths directly -- if the on-disk layout ever
+    needs to change, this is the only class that changes."""
+
+    def __init__(self, base_dir):
+        self.base_dir = base_dir
+        os.makedirs(self.base_dir, exist_ok=True)
+
+    def list_profiles(self):
+        return sorted(d for d in os.listdir(self.base_dir)
+                      if os.path.isdir(os.path.join(self.base_dir, d)))
+
+    def profile_dir(self, name):
+        d = os.path.join(self.base_dir, name)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def manifest_path(self, name):
+        return os.path.join(self.profile_dir(name), "manifest.json")
+
+    def load_manifest(self, name):
+        path = self.manifest_path(name)
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"profile": name, "runs": [], "active_run_id": None,
+                "last_good_dir": "", "last_defect_dir": "", "last_model": "PatchCore"}
+
+    def save_manifest(self, name, manifest):
+        with open(self.manifest_path(name), "w") as f:
+            json.dump(manifest, f, indent=2)
+
+    def create_profile(self, name):
+        name = name.strip()
+        if not name:
+            raise ValueError("Profile name can't be empty")
+        self.profile_dir(name)
+        if not os.path.exists(self.manifest_path(name)):
+            self.save_manifest(name, self.load_manifest(name))
+        return name
+
+    def remember_last_settings(self, name, good_dir, defect_dir, model_key):
+        manifest = self.load_manifest(name)
+        manifest["last_good_dir"] = good_dir
+        manifest["last_defect_dir"] = defect_dir
+        manifest["last_model"] = model_key
+        self.save_manifest(name, manifest)
+
+    def record_run(self, name, run_info, make_active=True):
+        manifest = self.load_manifest(name)
+        manifest["runs"].append(run_info)
+        if make_active:
+            manifest["active_run_id"] = run_info["run_id"]
+        self.save_manifest(name, manifest)
+        return manifest
+
+    def set_active_run(self, name, run_id):
+        manifest = self.load_manifest(name)
+        manifest["active_run_id"] = run_id
+        self.save_manifest(name, manifest)
+
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
+
+def list_images(folder):
+    """Returns sorted image file paths in folder, or [] if it doesn't
+    exist / isn't a folder. Cheap -- just a directory listing, no
+    decoding -- safe to call on every folder-picker change."""
+    if not folder or not os.path.isdir(folder):
+        return []
+    try:
+        return sorted(os.path.join(folder, f) for f in os.listdir(folder)
+                      if f.lower().endswith(IMAGE_EXTS))
+    except OSError:
+        return []
+
+
+def detect_gpu():
+    """Lightweight GPU presence check that does NOT import torch (torch
+    import alone can take a couple seconds and isn't needed just to
+    answer 'is there an NVIDIA GPU here') -- just checks for nvidia-smi."""
+    return shutil.which("nvidia-smi") is not None
+
+
+# ---------------------------------------------------------------- training --
+def _make_progress_callback(progress_cb, max_epochs):
+    """BEST-EFFORT epoch-progress reporting via a PyTorch Lightning
+    callback (anomalib's Engine wraps a Lightning Trainer under the
+    hood). Wrapped so that if the Callback import or the Engine's
+    `callbacks=` kwarg isn't supported by your installed anomalib/
+    lightning version, training still proceeds fine -- the progress bar
+    just won't move, and the text log keeps updating at each named stage
+    regardless. This is the single piece most likely to need adjusting
+    for your exact anomalib version -- if it silently doesn't work,
+    that's expected-possible, not a sign something else is broken.
+
+    PatchCore/PaDiM don't do real gradient-descent training (effectively
+    one pass), so their bar will jump straight to 100% -- that's correct,
+    not a bug; EfficientAd is where this is actually informative."""
+    try:
+        try:
+            from lightning.pytorch.callbacks import Callback
+        except ImportError:
+            from pytorch_lightning.callbacks import Callback
+
+        class _EpochProgress(Callback):
+            def on_train_epoch_end(self, trainer, pl_module):
+                epoch = trainer.current_epoch + 1
+                pct = int(100 * epoch / max(max_epochs, 1))
+                progress_cb(f"PROGRESS:{pct}:Epoch {epoch}/{max_epochs} complete")
+
+        return _EpochProgress()
+    except Exception:
+        return None
+
+
+def save_example_heatmaps(model, engine, datamodule, run_dir, max_examples=4):
+    """BEST-EFFORT example anomaly-heatmap thumbnails. anomalib's exact
+    prediction output shape/attribute names (`batch.image`,
+    `batch.anomaly_map`, tensor layout) have varied across versions, so
+    every step here is guarded. If anything doesn't match your installed
+    version, this returns None and training results are otherwise
+    unaffected -- you simply won't get preview thumbnails this run. If
+    you want this working, send me the exact attribute/shape your
+    installed anomalib actually returns from engine.predict() and I'll
+    adjust this to match precisely."""
+    try:
+        import numpy as np
+
+        examples_dir = os.path.join(run_dir, "examples")
+        os.makedirs(examples_dir, exist_ok=True)
+        predictions = engine.predict(model=model, datamodule=datamodule)
+        if not predictions:
+            return None
+
+        saved = 0
+        for batch in predictions:
+            images = getattr(batch, "image", None)
+            anomaly_maps = getattr(batch, "anomaly_map", None)
+            if images is None or anomaly_maps is None:
+                continue
+            for i in range(len(images)):
+                if saved >= max_examples:
+                    return examples_dir if saved > 0 else None
+                img_t, amap_t = images[i], anomaly_maps[i]
+                img_np = img_t.detach().cpu().numpy() if hasattr(img_t, "detach") else np.asarray(img_t)
+                amap_np = amap_t.detach().cpu().numpy() if hasattr(amap_t, "detach") else np.asarray(amap_t)
+                if img_np.ndim == 3 and img_np.shape[0] in (1, 3):
+                    img_np = np.transpose(img_np, (1, 2, 0))  # CHW -> HWC
+                amap_np = amap_np.squeeze()
+                img_np = (img_np - img_np.min()) / max(img_np.max() - img_np.min(), 1e-6)
+                img_u8 = (img_np * 255).astype("uint8")
+                base = img_u8 if img_u8.ndim == 3 else np.stack([img_u8] * 3, axis=-1)
+
+                amap_norm = (amap_np - amap_np.min()) / max(amap_np.max() - amap_np.min(), 1e-6)
+                heat = np.zeros((*amap_norm.shape, 3), dtype="uint8")
+                heat[..., 0] = (amap_norm * 255).astype("uint8")  # red channel = anomaly strength
+                if base.shape[:2] != heat.shape[:2]:
+                    heat = np.array(Image.fromarray(heat).resize((base.shape[1], base.shape[0])))
+                overlay = (0.6 * base + 0.4 * heat).astype("uint8")
+
+                Image.fromarray(overlay).save(os.path.join(examples_dir, f"example_{saved}.png"))
+                saved += 1
+        return examples_dir if saved > 0 else None
+    except Exception:
+        return None
+
+
+def write_model_card(run_dir, profile, plugin, good_dir, defect_dir, max_epochs, metrics, onnx_path):
+    """A short human-readable summary of exactly what was trained, on
+    what data, and how well it did -- dropped into the run folder next to
+    the checkpoint/export, so a run is self-documenting even months later
+    without needing to remember what settings produced it."""
+    lines = [
+        f"# Model Card -- {profile} / {plugin.display_name}",
+        "",
+        f"**Trained:** {datetime.now().isoformat(timespec='seconds')}",
+        f"**Profile:** {profile}",
+        f"**Model:** {plugin.display_name} (`{plugin.key}`)",
+        f"**Max epochs setting:** {max_epochs}",
+        "",
+        "## Dataset",
+        f"- Good (training) images: `{good_dir}`",
+        f"- Defect (validation) images: `{defect_dir or 'none provided'}`",
+        "",
+        "## Validation Metrics",
+    ]
+    if metrics:
+        for k, v in metrics.items():
+            try:
+                lines.append(f"- **{k}:** {float(v):.4f}")
+            except (TypeError, ValueError):
+                lines.append(f"- **{k}:** {v}")
+    else:
+        lines.append("- No validation metrics (no defect folder was given)")
+    lines += [
+        "",
+        "## Export",
+        f"- ONNX path: `{onnx_path or 'not exported'}`",
+        "",
+        "## About this model",
+        f"- {plugin.description}",
+    ]
+    path = os.path.join(run_dir, "MODEL_CARD.md")
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    return path
+
+
+def run_training_job(profile, good_dir, defect_dir, plugin, run_dir, max_epochs, progress_cb, done_cb):
+    """Runs entirely on a background thread. Knows nothing about Tkinter
+    or profiles -- just trains `plugin`'s model on `good_dir`, validates
+    against `defect_dir` if given, and saves everything under `run_dir`
+    (the caller/ProfileManager decides what that path actually is).
+    progress_cb(str) reports status lines; done_cb(result_dict_or_None,
+    error_str_or_None) is called exactly once at the end."""
     try:
         progress_cb("Importing anomalib / torch (first run can take a while)...")
         from anomalib.data import Folder
         from anomalib.engine import Engine
 
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = os.path.join(WORKDIR, f"{model_name}_{run_id}")
         os.makedirs(run_dir, exist_ok=True)
 
         progress_cb(f"Preparing dataset (good={good_dir}, defect={defect_dir or 'none'})...")
-        # anomalib's Folder datamodule expects: a folder of normal images
-        # for training, and optionally a folder of abnormal images used
-        # for test/validation (never for training -- these models never
-        # train on defects, that's the whole point).
         datamodule_kwargs = dict(
             name="camera_module",
             root=os.path.dirname(good_dir),
             normal_dir=os.path.basename(good_dir),
-            task="classification",  # image-level anomaly score; we have no pixel masks for segmentation
+            task="classification",
         )
         if defect_dir and os.path.isdir(defect_dir) and os.listdir(defect_dir):
             datamodule_kwargs["abnormal_dir"] = os.path.basename(defect_dir)
         datamodule = Folder(**datamodule_kwargs)
         datamodule.setup()
 
-        progress_cb(f"Building model: {model_name}...")
-        model = _build_anomalib_model(model_name)
+        progress_cb(f"Building model: {plugin.display_name}...")
+        model = plugin.build()
 
         progress_cb("Starting training...")
-        engine = Engine(default_root_dir=run_dir, max_epochs=max_epochs)
+        epoch_cb = _make_progress_callback(progress_cb, max_epochs)
+        try:
+            engine = Engine(default_root_dir=run_dir, max_epochs=max_epochs,
+                             callbacks=[epoch_cb] if epoch_cb else [])
+        except TypeError:
+            # this anomalib/lightning version's Engine doesn't accept
+            # callbacks= the way expected -- training still runs fine,
+            # just without the live progress-bar updates
+            progress_cb("(Couldn't attach the live epoch-progress callback for this anomalib "
+                        "version -- training will still run, just without the progress bar moving.)")
+            engine = Engine(default_root_dir=run_dir, max_epochs=max_epochs)
         engine.fit(datamodule=datamodule, model=model)
 
         metrics = {}
@@ -172,8 +427,7 @@ def run_training_job(good_dir, defect_dir, model_name, max_epochs, progress_cb, 
             if test_results:
                 metrics = dict(test_results[0])
         else:
-            progress_cb("No defect folder given -- skipping validation metrics "
-                        "(training still completed; you just won't get an AUROC number).")
+            progress_cb("No defect folder given -- skipping validation metrics.")
 
         progress_cb("Exporting to ONNX...")
         onnx_dir = os.path.join(run_dir, "export")
@@ -185,17 +439,32 @@ def run_training_job(good_dir, defect_dir, model_name, max_epochs, progress_cb, 
             onnx_path = str(exported) if exported else None
         except Exception as export_err:
             progress_cb(f"ONNX export step raised: {export_err} "
-                        "(training + metrics still succeeded -- see the run folder for "
-                        "the raw checkpoint even if ONNX export needs a manual retry).")
+                        "(training + metrics still succeeded).")
+
+        examples_dir = None
+        if defect_dir and os.path.isdir(defect_dir) and os.listdir(defect_dir):
+            progress_cb("Generating example heatmaps...")
+            examples_dir = save_example_heatmaps(model, engine, datamodule, run_dir)
+            if examples_dir:
+                progress_cb(f"Saved example heatmaps to {examples_dir}")
+            else:
+                progress_cb("Couldn't generate example heatmaps for this anomalib version "
+                            "(training results are otherwise complete).")
+
+        model_card_path = write_model_card(run_dir, profile, plugin, good_dir, defect_dir, max_epochs, metrics, onnx_path)
 
         result = {
+            "run_id": os.path.basename(run_dir),
             "run_dir": run_dir,
-            "model_name": model_name,
+            "model_key": plugin.key,
             "metrics": metrics,
             "onnx_path": onnx_path,
+            "model_card_path": model_card_path,
+            "examples_dir": examples_dir,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
         }
         with open(os.path.join(run_dir, "result_summary.json"), "w") as f:
-            json.dump({k: v for k, v in result.items() if k != "onnx_path" or v}, f, indent=2, default=str)
+            json.dump(result, f, indent=2, default=str)
 
         progress_cb("Done.")
         done_cb(result, None)
@@ -775,9 +1044,9 @@ ICONS_B64 = {
 
 
 def _icon(name, size=20):
-    """Decodes an embedded base64 icon into a CTkImage. Returns None (and
-    the UI just skips the icon) if the name isn't found, rather than
-    crashing -- icons are decoration, never load-bearing."""
+    """Decodes an embedded base64 icon into a CTkImage. Returns None (icon
+    just gets skipped) rather than crashing -- icons are decoration, never
+    load-bearing."""
     b64 = ICONS_B64.get(name)
     if not b64:
         return None
@@ -792,8 +1061,8 @@ class TrainingStudioApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Training Studio -- Anomaly Model Trainer")
-        self.root.geometry("1280x860")
-        self.root.minsize(1040, 700)
+        self.root.geometry("1320x900")
+        self.root.minsize(1080, 720)
         self.root.configure(fg_color=BG)
 
         self.f_title = ctk.CTkFont(size=26, weight="bold")
@@ -804,21 +1073,30 @@ class TrainingStudioApp:
         self.f_small = ctk.CTkFont(size=11)
         self.f_stat = ctk.CTkFont(size=26, weight="bold")
 
-        # pre-load every icon once, keyed by name, at the sizes actually used
         self.icons = {}
         for name in ICONS_B64:
             self.icons[f"{name}_20"] = _icon(name, 20)
             self.icons[f"{name}_28"] = _icon(name, 28)
 
+        self.profile_mgr = ProfileManager(WORKDIR)
+        self.gpu_available = detect_gpu()
+
+        self.profile_var = tk.StringVar(value="")
         self.good_dir_var = tk.StringVar(value="")
         self.defect_dir_var = tk.StringVar(value="")
-        self.model_var = tk.StringVar(value="PatchCore")
+        self.model_var = tk.StringVar(value=next(iter(MODEL_REGISTRY)))
         self.epochs_var = tk.StringVar(value="1")
         self.status_var = tk.StringVar(value="Idle")
         self.training_running = False
-        self._last_run_dir = None
+        self._last_result = None
+        self.model_card_widgets = {}
+        self.dataset_previews = {}
+        self._compare_selection = []
+        self._history_runs_by_id = {}
+        self._example_photos = []
 
         self._build_ui()
+        self._refresh_profile_list(select_first=True)
 
     # ------------------------------------------------------------ helpers
     def ic(self, name, size=20):
@@ -847,11 +1125,20 @@ class TrainingStudioApp:
         defaults.update(kw)
         return ctk.CTkFrame(parent, **defaults)
 
-    def _icon_badge(self, parent, icon, size=48, bg=ACCENT, icon_size=24):
+    def _pill(self, parent, textvariable, text_color=TEXT_MUTED):
+        """A small rounded status badge. Built as a frame + inner label so
+        padding always uses .pack(padx=,pady=), which every customtkinter
+        version supports -- rather than passing padx/pady to the CTkLabel
+        constructor itself, which isn't consistently supported."""
+        frame = ctk.CTkFrame(parent, fg_color=BG_CARD_ALT, corner_radius=10)
+        label = ctk.CTkLabel(frame, textvariable=textvariable, font=self.f_small, text_color=text_color)
+        label.pack(padx=10, pady=3)
+        return frame, label
+
+    def _icon_badge(self, parent, icon, size=48, bg=ACCENT, icon_size=28):
         badge = ctk.CTkFrame(parent, fg_color=bg, corner_radius=size // 4, width=size, height=size)
         badge.pack_propagate(False)
-        img = self.ic(icon, icon_size if icon_size in (20, 28) else 20)
-        ctk.CTkLabel(badge, text="", image=img).pack(expand=True)
+        ctk.CTkLabel(badge, text="", image=self.ic(icon, icon_size)).pack(expand=True)
         return badge
 
     # ------------------------------------------------------------ layout
@@ -866,8 +1153,12 @@ class TrainingStudioApp:
         title_box = ctk.CTkFrame(header, fg_color="transparent")
         title_box.pack(side="left")
         ctk.CTkLabel(title_box, text="Training Studio", font=self.f_title, text_color=TEXT).pack(anchor="w")
-        ctk.CTkLabel(title_box, text="Train an anomaly-detection model on good images, validate against defects, export to ONNX",
+        ctk.CTkLabel(title_box, text="Train an anomaly-detection model per phone model, validate, export to ONNX",
                      font=self.f_subtitle, text_color=TEXT_MUTED).pack(anchor="w", pady=(2, 0))
+
+        gpu_frame, gpu_label = self._pill(header, tk.StringVar(value="GPU: Detected" if self.gpu_available else "GPU: Not detected"),
+                                           text_color=SUCCESS if self.gpu_available else TEXT_MUTED)
+        gpu_frame.pack(side="right", pady=(6, 0))
 
         # ---- two-column dashboard body ----
         body = ctk.CTkFrame(outer, fg_color="transparent")
@@ -886,6 +1177,27 @@ class TrainingStudioApp:
 
     # ------------------------------------------------------- left column
     def _build_left_column(self, parent):
+        # ---- 0. profile (which phone model this training run is for) ----
+        profile_card = self._card(parent)
+        profile_card.pack(fill="x", pady=(0, 14))
+        head0 = ctk.CTkFrame(profile_card, fg_color="transparent")
+        head0.pack(fill="x", padx=18, pady=(16, 10))
+        ctk.CTkLabel(head0, text="", image=self.ic("target_white")).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(head0, text="Model Profile (e.g. S26, A36)", font=self.f_section, text_color=TEXT).pack(side="left")
+
+        profile_row = ctk.CTkFrame(profile_card, fg_color="transparent")
+        profile_row.pack(fill="x", padx=18, pady=(0, 8))
+        self.profile_menu = ctk.CTkOptionMenu(profile_row, values=["(no profiles yet)"], variable=self.profile_var,
+                                               command=self._on_profile_change, fg_color=BG_CARD_ALT,
+                                               button_color=BG_CARD_ALT, button_hover_color=BORDER,
+                                               text_color=TEXT, dropdown_fg_color=BG_CARD_ALT,
+                                               dropdown_hover_color=BORDER, dropdown_text_color=TEXT)
+        self.profile_menu.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._btn_secondary(profile_row, "+ New Profile", self._new_profile, width=150).pack(side="left")
+        ctk.CTkLabel(profile_card, text="Each profile keeps its own trained models and remembers its last-used "
+                                         "dataset folders and model choice -- switching profiles switches all of that.",
+                     font=self.f_small, text_color=TEXT_MUTED, wraplength=460, justify="left").pack(anchor="w", padx=18, pady=(0, 16))
+
         # ---- 1. model ----
         model_card = self._card(parent)
         model_card.pack(fill="x", pady=(0, 14))
@@ -896,7 +1208,7 @@ class TrainingStudioApp:
 
         self.model_cards_frame = ctk.CTkFrame(model_card, fg_color="transparent")
         self.model_cards_frame.pack(fill="x", padx=14, pady=(0, 16))
-        self._rebuild_model_cards()
+        self._build_model_cards_once()
 
         # ---- 2. dataset ----
         data_card = self._card(parent)
@@ -906,8 +1218,8 @@ class TrainingStudioApp:
         ctk.CTkLabel(head2, text="", image=self.ic("folder_muted")).pack(side="left", padx=(0, 8))
         ctk.CTkLabel(head2, text="Dataset", font=self.f_section, text_color=TEXT).pack(side="left")
 
-        self._build_folder_picker(data_card, "Good images (training set)", self.good_dir_var)
-        self._build_folder_picker(data_card, "Defect images (validation, optional)", self.defect_dir_var)
+        self._build_folder_picker(data_card, "Good images (training set)", self.good_dir_var, "good")
+        self._build_folder_picker(data_card, "Defect images (validation, optional)", self.defect_dir_var, "defect")
 
         ctk.CTkLabel(data_card, text="Point these at your existing storage/results/OK and storage/results/NG "
                                       "folders -- no relabeling needed. Training only ever uses the good images; "
@@ -927,69 +1239,152 @@ class TrainingStudioApp:
         ctk.CTkLabel(epochs_row, text="Max epochs", font=self.f_small, text_color=TEXT_MUTED).pack(side="left", padx=(0, 8))
         ctk.CTkEntry(epochs_row, textvariable=self.epochs_var, width=60, fg_color=BG_CARD_ALT,
                      border_color=BORDER, text_color=TEXT).pack(side="left")
-        ctk.CTkLabel(epochs_row, text="(PatchCore/PaDiM don't do gradient-descent training -- this only matters for EfficientAd)",
+        ctk.CTkLabel(epochs_row, text="(only matters for EfficientAd -- PatchCore/PaDiM don't do gradient-descent training)",
                      font=self.f_small, text_color=TEXT_MUTED).pack(side="left", padx=(10, 0))
 
         self.train_btn = self._btn_primary(train_card, "Start Training", self.start_training,
                                             icon="play_white", width=220, height=48, font=self.f_body_bold)
         self.train_btn.pack(anchor="w", padx=18, pady=(12, 18))
 
-    def _build_folder_picker(self, parent, label_text, var):
+    def _build_folder_picker(self, parent, label_text, var, preview_key):
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", padx=18, pady=(0, 10))
         ctk.CTkLabel(row, text=label_text, font=self.f_body, text_color=TEXT).pack(anchor="w", pady=(0, 6))
         inner = ctk.CTkFrame(row, fg_color="transparent")
         inner.pack(fill="x")
-        entry = ctk.CTkEntry(inner, textvariable=var, fg_color=BG_CARD_ALT, border_color=BORDER,
-                              text_color=TEXT, corner_radius=8)
-        entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self._btn_secondary(inner, "Browse", lambda: self._browse(var), icon="folder_white", width=110).pack(side="left")
+        ctk.CTkEntry(inner, textvariable=var, fg_color=BG_CARD_ALT, border_color=BORDER,
+                     text_color=TEXT, corner_radius=8).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._btn_secondary(inner, "Browse", lambda: self._browse(var, preview_key), icon="folder_white", width=110).pack(side="left")
 
-    def _rebuild_model_cards(self):
-        for w in self.model_cards_frame.winfo_children():
+        count_label = ctk.CTkLabel(row, text="", font=self.f_small, text_color=TEXT_MUTED)
+        count_label.pack(anchor="w", pady=(8, 0))
+        thumbs_row = ctk.CTkFrame(row, fg_color="transparent")
+        thumbs_row.pack(fill="x", pady=(4, 0))
+        self.dataset_previews[preview_key] = {"count_label": count_label, "thumbs_row": thumbs_row, "photos": []}
+        self._refresh_dataset_preview(preview_key, var.get())
+
+    def _refresh_dataset_preview(self, key, folder):
+        info = self.dataset_previews.get(key)
+        if not info:
+            return
+        for w in info["thumbs_row"].winfo_children():
             w.destroy()
-        for name, info in MODEL_CHOICES.items():
-            selected = (self.model_var.get() == name)
-            card = ctk.CTkFrame(self.model_cards_frame, fg_color=ACCENT_SOFT if selected else BG_CARD_ALT,
-                                 corner_radius=10, border_width=2, border_color=ACCENT if selected else BORDER,
-                                 cursor="hand2")
+        info["photos"] = []
+        if not folder:
+            info["count_label"].configure(text="")
+            return
+        images = list_images(folder)
+        info["count_label"].configure(text=f"{len(images)} image(s) found" if images else "No images found in this folder")
+        for path in images[:6]:
+            try:
+                img = Image.open(path).convert("RGB")
+                img.thumbnail((56, 56))
+                photo = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+                info["photos"].append(photo)  # keep a reference -- Tkinter drops images with no owner
+                ctk.CTkLabel(info["thumbs_row"], text="", image=photo).pack(side="left", padx=(0, 6))
+            except Exception:
+                continue
+
+    # --------------------------------------------- model cards (no flicker)
+    # Built ONCE; selecting a different model only reconfigures colors and
+    # shows/hides the checkmark on the existing widgets. The earlier
+    # version destroyed and rebuilt all 3 cards on every click, which is
+    # what caused the visible flicker -- Tkinter has to tear down and
+    # re-lay-out the whole widget subtree, which is never free. This has
+    # nothing to do with threading (training already runs on its own
+    # background thread) -- it's purely a "don't rebuild what you can
+    # just recolor" fix.
+    def _build_model_cards_once(self):
+        self.model_card_widgets = {}
+        for key, plugin in MODEL_REGISTRY.items():
+            card = ctk.CTkFrame(self.model_cards_frame, corner_radius=10, border_width=2, cursor="hand2")
             card.pack(fill="x", pady=4)
             inner = ctk.CTkFrame(card, fg_color="transparent")
             inner.pack(fill="x", padx=14, pady=10)
 
-            icon_circle = ctk.CTkFrame(inner, fg_color=ACCENT if selected else BG_CANVAS, corner_radius=8,
-                                        width=38, height=38)
+            icon_circle = ctk.CTkFrame(inner, corner_radius=8, width=38, height=38)
             icon_circle.pack(side="left", padx=(0, 12))
             icon_circle.pack_propagate(False)
-            ctk.CTkLabel(icon_circle, text="", image=self.ic(info["icon"])).pack(expand=True)
+            ctk.CTkLabel(icon_circle, text="", image=self.ic(plugin.icon)).pack(expand=True)
 
             text_box = ctk.CTkFrame(inner, fg_color="transparent")
             text_box.pack(side="left", fill="x", expand=True)
             name_row = ctk.CTkFrame(text_box, fg_color="transparent")
             name_row.pack(fill="x", anchor="w")
-            ctk.CTkLabel(name_row, text=name, font=self.f_body_bold, text_color=TEXT).pack(side="left")
-            if selected:
-                ctk.CTkLabel(name_row, text="", image=self.ic("check_accent")).pack(side="left", padx=(8, 0))
-            if info["needs_gpu_for_speed"]:
-                gpu_tag = ctk.CTkLabel(name_row, text="FASTER WITH GPU", font=self.f_small, text_color=WARNING)
-                gpu_tag.pack(side="left", padx=(10, 0))
-            ctk.CTkLabel(text_box, text=info["desc"], font=self.f_small, text_color=TEXT_MUTED,
+            ctk.CTkLabel(name_row, text=plugin.display_name, font=self.f_body_bold, text_color=TEXT).pack(side="left")
+            checkmark = ctk.CTkLabel(name_row, text="", image=self.ic("check_accent"))
+            if plugin.needs_gpu_for_speed:
+                gpu_txt = "GPU detected -- will be fast" if self.gpu_available else "no GPU detected -- will be slow"
+                gpu_color = SUCCESS if self.gpu_available else WARNING
+                ctk.CTkLabel(name_row, text=gpu_txt, font=self.f_small, text_color=gpu_color).pack(side="left", padx=(10, 0))
+            ctk.CTkLabel(text_box, text=plugin.description, font=self.f_small, text_color=TEXT_MUTED,
                          wraplength=380, justify="left").pack(anchor="w", pady=(3, 0))
 
             for widget in (card, inner, icon_circle, text_box, name_row):
-                widget.bind("<Button-1>", lambda e, n=name: self._select_model(n))
-                widget.configure(cursor="hand2") if hasattr(widget, "configure") else None
+                widget.bind("<Button-1>", lambda e, k=key: self._select_model(k))
 
-    def _select_model(self, name):
-        if self.model_var.get() == name:
+            self.model_card_widgets[key] = {"card": card, "icon_circle": icon_circle, "checkmark": checkmark}
+        self._update_model_card_styles()
+
+    def _update_model_card_styles(self):
+        for key, w in self.model_card_widgets.items():
+            selected = (self.model_var.get() == key)
+            w["card"].configure(fg_color=ACCENT_SOFT if selected else BG_CARD_ALT,
+                                 border_color=ACCENT if selected else BORDER)
+            w["icon_circle"].configure(fg_color=ACCENT if selected else BG_CANVAS)
+            if selected:
+                w["checkmark"].pack(side="left", padx=(8, 0))
+            else:
+                w["checkmark"].pack_forget()
+
+    def _select_model(self, key):
+        if self.model_var.get() == key:
             return
-        self.model_var.set(name)
-        self._rebuild_model_cards()
+        self.model_var.set(key)
+        self._update_model_card_styles()
+
+    # ---------------------------------------------------------- profiles
+    def _refresh_profile_list(self, select_first=False):
+        profiles = self.profile_mgr.list_profiles()
+        values = profiles if profiles else ["(no profiles yet)"]
+        self.profile_menu.configure(values=values)
+        if select_first and profiles:
+            self.profile_var.set(profiles[0])
+            self._on_profile_change(profiles[0])
+        elif not profiles:
+            self.profile_var.set(values[0])
+
+    def _new_profile(self):
+        name = simpledialog.askstring("New Profile", "Phone model name (e.g. S26, A36):", parent=self.root)
+        if not name:
+            return
+        try:
+            self.profile_mgr.create_profile(name)
+        except ValueError as e:
+            messagebox.showerror("Training Studio", str(e))
+            return
+        self._refresh_profile_list()
+        self.profile_var.set(name)
+        self._on_profile_change(name)
+
+    def _on_profile_change(self, name):
+        if not name or name.startswith("("):
+            return
+        manifest = self.profile_mgr.load_manifest(name)
+        self.good_dir_var.set(manifest.get("last_good_dir", ""))
+        self.defect_dir_var.set(manifest.get("last_defect_dir", ""))
+        self._refresh_dataset_preview("good", self.good_dir_var.get())
+        self._refresh_dataset_preview("defect", self.defect_dir_var.get())
+        last_model = manifest.get("last_model")
+        if last_model in MODEL_REGISTRY:
+            self.model_var.set(last_model)
+            self._update_model_card_styles()
+        self._refresh_run_history()
 
     # ------------------------------------------------------ right column
     def _build_right_column(self, parent):
         parent.grid_rowconfigure(0, weight=3)
-        parent.grid_rowconfigure(1, weight=2)
+        parent.grid_rowconfigure(1, weight=3)
         parent.grid_columnconfigure(0, weight=1)
 
         # ---- progress ----
@@ -999,9 +1394,12 @@ class TrainingStudioApp:
         log_head.pack(fill="x", padx=18, pady=(16, 8))
         ctk.CTkLabel(log_head, text="", image=self.ic("barchart_muted")).pack(side="left", padx=(0, 8))
         ctk.CTkLabel(log_head, text="Progress", font=self.f_section, text_color=TEXT).pack(side="left")
-        self.status_pill = ctk.CTkLabel(log_head, textvariable=self.status_var, font=self.f_small, text_color=TEXT_MUTED,
-                                         fg_color=BG_CARD_ALT, corner_radius=10, padx=10, pady=3)
-        self.status_pill.pack(side="right")
+        self.status_pill_frame, self.status_pill = self._pill(log_head, self.status_var)
+        self.status_pill_frame.pack(side="right")
+
+        self.progress_bar = ctk.CTkProgressBar(log_card, progress_color=ACCENT, fg_color=BG_CARD_ALT)
+        self.progress_bar.pack(fill="x", padx=18, pady=(0, 10))
+        self.progress_bar.set(0)
 
         wrap = ctk.CTkFrame(log_card, fg_color=BG_CANVAS, corner_radius=10)
         wrap.pack(fill="both", expand=True, padx=14, pady=(0, 16))
@@ -1010,7 +1408,7 @@ class TrainingStudioApp:
         self.log_box.pack(fill="both", expand=True, padx=4, pady=4)
         self.log_box.configure(state="disabled")
 
-        # ---- results ----
+        # ---- results + run history ----
         self.results_card = self._card(parent)
         self.results_card.grid(row=1, column=0, sticky="nsew")
         res_head = ctk.CTkFrame(self.results_card, fg_color="transparent")
@@ -1019,136 +1417,34 @@ class TrainingStudioApp:
         ctk.CTkLabel(res_head, text="Results", font=self.f_section, text_color=TEXT).pack(side="left")
 
         self.results_body = ctk.CTkFrame(self.results_card, fg_color="transparent")
-        self.results_body.pack(fill="both", expand=True, padx=18, pady=(0, 16))
-        self.results_placeholder = ctk.CTkLabel(self.results_body, text="Train a model to see results here.",
-                                                 font=self.f_body, text_color=TEXT_MUTED)
-        self.results_placeholder.pack(anchor="w")
+        self.results_body.pack(fill="x", padx=18, pady=(0, 8))
+        ctk.CTkLabel(self.results_body, text="Train a model to see results here.",
+                     font=self.f_body, text_color=TEXT_MUTED).pack(anchor="w")
 
-    # -------------------------------------------------------------- logic
-    def _browse(self, var):
-        path = filedialog.askdirectory(title="Select folder")
-        if path:
-            var.set(path)
+        history_head = ctk.CTkFrame(self.results_card, fg_color="transparent")
+        history_head.pack(fill="x", padx=18, pady=(8, 6))
+        ctk.CTkLabel(history_head, text="Run history for this profile", font=self.f_body_bold, text_color=TEXT).pack(side="left")
+        self._btn_secondary(history_head, "Compare Selected", self._open_compare_window, width=150, height=28).pack(side="right")
+        self.history_body = ctk.CTkScrollableFrame(self.results_card, fg_color="transparent")
+        self.history_body.pack(fill="both", expand=True, padx=10, pady=(0, 14))
 
-    def _log(self, line):
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", f"[{datetime.now().strftime('%H:%M:%S')}] {line}\n")
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
-
-    def start_training(self):
-        if self.training_running:
-            return
-        good_dir = self.good_dir_var.get().strip()
-        defect_dir = self.defect_dir_var.get().strip()
-        if not good_dir or not os.path.isdir(good_dir):
-            messagebox.showwarning("Training Studio", "Pick a valid 'good images' folder first.")
-            return
-        if not os.listdir(good_dir):
-            messagebox.showwarning("Training Studio", "That good-images folder is empty.")
-            return
-        try:
-            max_epochs = int(self.epochs_var.get())
-        except ValueError:
-            messagebox.showerror("Training Studio", "Max epochs must be a number.")
-            return
-
-        model_name = self.model_var.get()
-        self.training_running = True
-        self.train_btn.configure(text="Training...", state="disabled", fg_color=BG_CARD_ALT)
-        self.status_var.set("Running")
-        self.status_pill.configure(text_color=WARNING)
-        self.log_box.configure(state="normal")
-        self.log_box.delete("1.0", "end")
-        self.log_box.configure(state="disabled")
-        self._log(f"Starting {model_name} training run.")
-
-        threading.Thread(
-            target=run_training_job,
-            args=(good_dir, defect_dir, model_name, max_epochs,
-                  lambda msg: self.root.after(0, self._log, msg),
-                  lambda result, err: self.root.after(0, self._finish_training, result, err)),
-            daemon=True,
-        ).start()
-
-    def _finish_training(self, result, error):
-        self.training_running = False
-        self.train_btn.configure(text="Start Training", state="normal", fg_color=ACCENT)
-        for w in self.results_body.winfo_children():
+    def _refresh_run_history(self):
+        for w in self.history_body.winfo_children():
             w.destroy()
-
-        if error:
-            self.status_var.set("Failed")
-            self.status_pill.configure(text_color=DANGER)
-            self._log("ERROR:\n" + error)
-            err_row = ctk.CTkFrame(self.results_body, fg_color="transparent")
-            err_row.pack(fill="x", anchor="w")
-            ctk.CTkLabel(err_row, text="", image=self.ic("alertTriangle")).pack(side="left", padx=(0, 8))
-            ctk.CTkLabel(err_row, text="Training failed -- see the Progress log for the full traceback.",
-                         font=self.f_body, text_color=DANGER).pack(side="left")
-            messagebox.showerror("Training Studio",
-                                  "Training failed -- see the Progress log for the full error. "
-                                  "If this looks like an anomalib API mismatch, tell me the exact "
-                                  "message and your `pip show anomalib` version and I'll fix the code.")
+        name = self.profile_var.get()
+        if not name or name.startswith("("):
             return
-
-        self.status_var.set("Done")
-        self.status_pill.configure(text_color=SUCCESS)
-        self._last_run_dir = result["run_dir"]
-        metrics = result.get("metrics") or {}
-
-        done_row = ctk.CTkFrame(self.results_body, fg_color="transparent")
-        done_row.pack(fill="x", anchor="w", pady=(0, 12))
-        ctk.CTkLabel(done_row, text="", image=self.ic("check_success")).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(done_row, text=f"{result['model_name']} training complete", font=self.f_body_bold, text_color=TEXT).pack(side="left")
-
-        if metrics:
-            tiles_row = ctk.CTkFrame(self.results_body, fg_color="transparent")
-            tiles_row.pack(fill="x", pady=(0, 12))
-            for i, (k, v) in enumerate(metrics.items()):
-                tiles_row.grid_columnconfigure(i, weight=1)
-                tile = ctk.CTkFrame(tiles_row, fg_color=BG_CARD_ALT, corner_radius=10)
-                tile.grid(row=0, column=i, sticky="nsew", padx=4)
-                try:
-                    fv = float(v)
-                    vs = f"{fv * 100:.1f}%" if 0 <= fv <= 1 else f"{fv:.3f}"
-                except (TypeError, ValueError):
-                    vs = str(v)
-                ctk.CTkLabel(tile, text=vs, font=self.f_stat, text_color=ACCENT).pack(pady=(14, 0))
-                ctk.CTkLabel(tile, text=k, font=self.f_small, text_color=TEXT_MUTED).pack(pady=(0, 14))
-        else:
-            ctk.CTkLabel(self.results_body, text="No validation metrics (no defect folder was given) -- "
-                                                  "training itself completed fine.",
-                         font=self.f_small, text_color=TEXT_MUTED, wraplength=460, justify="left").pack(anchor="w", pady=(0, 12))
-
-        path_row = ctk.CTkFrame(self.results_body, fg_color="transparent")
-        path_row.pack(fill="x", anchor="w", pady=(0, 10))
-        onnx_txt = result.get("onnx_path") or "not completed -- check the Progress log"
-        ctk.CTkLabel(path_row, text=f"ONNX export: {onnx_txt}", font=self.f_small, text_color=TEXT_MUTED,
-                     wraplength=460, justify="left").pack(anchor="w")
-
-        self._btn_secondary(self.results_body, "Open Run Folder", self._open_last_run_folder,
-                             icon="hardDrive_white", width=180).pack(anchor="w")
-
-    def _open_last_run_folder(self):
-        if not self._last_run_dir:
+        manifest = self.profile_mgr.load_manifest(name)
+        runs = list(reversed(manifest.get("runs", [])))
+        active_id = manifest.get("active_run_id")
+        self._history_runs_by_id = {r["run_id"]: r for r in runs}
+        # drop any stale selections from a previous profile/run set
+        self._compare_selection = [rid for rid in self._compare_selection if rid in self._history_runs_by_id]
+        if not runs:
+            ctk.CTkLabel(self.history_body, text="No runs yet for this profile.",
+                         font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=8, pady=4)
             return
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(self._last_run_dir)
-            elif sys.platform == "darwin":
-                os.system(f'open "{self._last_run_dir}"')
-            else:
-                os.system(f'xdg-open "{self._last_run_dir}"')
-        except Exception:
-            messagebox.showinfo("Training Studio", f"Run folder: {self._last_run_dir}")
-
-
-def main():
-    root = ctk.CTk()
-    TrainingStudioApp(root)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
+        for run in runs:
+            row = ctk.CTkFrame(self.history_body, fg_color=BG_CARD_ALT, corner_radius=8)
+            row.pack(fill="x", pady=3, padx=4)
+            is_active = run.get("run_id") 
