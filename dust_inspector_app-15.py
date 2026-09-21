@@ -19,8 +19,8 @@ Single-file desktop app, restructured into TWO windows:
      ROI placement + two-point calibration (the one interactive canvas
      in the whole app), detection parameters, and camera settings.
 
-Single-threaded detection call per inspection (dust/thread/glue
-classification via run_zscore_detection), still run on a background
+Single-threaded detection call per inspection (dust-only detection via
+run_zscore_detection), still run on a background
 thread so the UI/feed never freezes. (Vinyl/lamination-film detection --
 detect_vinyl_presence -- is implemented below but not currently wired
 into the active inspection flow; re-enable later once the fiber/thread
@@ -81,10 +81,8 @@ VINYL_COLOR = "#a855f7"  # distinct from PASS/FAIL/IN-PROGRESS so it reads as it
 # BGR (for cv2 drawing, not the hex UI colors above) per defect type
 BLOB_COLOR_BGR = {
     "dust": (0, 0, 255),      # red
-    "thread": (0, 165, 255),  # amber
-    "glue": (255, 0, 255),    # magenta
 }
-VINYL_COLOR_BGR = (245, 85, 168)  # pink-purple, kept distinct from glue's magenta
+VINYL_COLOR_BGR = (245, 85, 168)  # pink-purple
 
 # ---------------------------------------------------------------- storage --
 if getattr(sys, "frozen", False):
@@ -178,11 +176,6 @@ DEFAULT_SETTINGS = {
     "min_area": 4.0,
     "min_circularity": 0.55,
     "min_diameter_mm": 0.1,
-    "min_aspect_ratio": 3.0,
-    "max_thin_width_px": 8.0,
-    "max_arc_fit_residual": 0.12,
-    "gap_bridge_px": 11.0,
-    "z_thr_low": 1.5,
     "vinyl_tolerance_px": 15.0,
     "vinyl_strength_thr": 6.0,
     "model_name": "",
@@ -314,75 +307,28 @@ class CameraManager:
 
 
 # ---------------------------------------------------------------- detect ----
-def _fit_circle(pts):
-    """Algebraic (Kasa) least-squares circle fit through a set of 2D
-    points. Returns (radius, rms_residual) -- residual is how far the
-    points typically sit from that best-fit circle (0 = perfect fit).
-    Returns (None, None) if the fit is degenerate."""
-    x, y = pts[:, 0], pts[:, 1]
-    A = np.column_stack([2 * x, 2 * y, np.ones(len(x))])
-    b = x ** 2 + y ** 2
-    try:
-        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
-    except Exception:
-        return None, None
-    a_c, b_c, c = sol
-    r2 = c + a_c ** 2 + b_c ** 2
-    if r2 <= 0:
-        return None, None
-    r = np.sqrt(r2)
-    dists = np.sqrt((x - a_c) ** 2 + (y - b_c) ** 2)
-    resid = float(np.sqrt(np.mean((dists - r) ** 2)))
-    return float(r), resid
-
-
-
 def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity=0.55,
-                          mm_per_px=None, min_diameter_mm=0.0,
-                          min_aspect_ratio=3.0, max_thin_width_px=8.0, max_arc_fit_residual=0.12,
-                          gap_bridge_px=7.0, z_thr_low=1.5, debug=False):
+                          mm_per_px=None, min_diameter_mm=0.0, debug=False):
     """Core Z-score math is UNCHANGED: local Z-score via boxFilter mean/std,
     thresholded inside the union of all circular ROI masks.
 
-    Every surviving connected blob is then classified by SHAPE:
-      - round + big + circular enough                          -> DUST
-      - elongated (length/width >= min_aspect_ratio), thin
-        (width <= max_thin_width_px), and its points do NOT fit
-        a large circle well                                     -> THREAD/FIBER
-      - elongated + thin AND its points cleanly fit a circle
-        much bigger than itself                                 -> ARC, rejected
-      - elongated + wide (width > max_thin_width_px)            -> GLUE
-
-    Why fit-to-a-circle instead of just "is it curved": a real optical
-    reflection or lens/coating edge is a segment of one PHYSICALLY FIXED
-    circle (the lens/module geometry), so it fits a single circle almost
-    perfectly. A real thread that fell and landed on the module can bend
-    into pretty much any shape -- but it essentially never happens to
-    trace a clean arc of one big fixed-radius circle. So "is this shape
-    curved" is the wrong question (a real thread is very often curved
-    too); "does this shape trace a genuine large circle" is the right one,
-    and that's what's tested here, on the actual contour points -- not on
-    a straight bounding-box proxy, which breaks down for curved shapes.
-
-    This replaced an earlier blanket morphological opening: that approach
-    reliably erased thin curved lens/reflection arcs, but it also erased
-    genuinely thin thread/fiber contamination, since both are "thin"
-    shapes geometrically -- one blunt filter can't tell them apart. A
-    light CLOSING is used instead (bridges tiny gaps in a thin shape's
-    raw mask, never erases it), and classification happens by shape
-    afterwards, on the whole contour.
+    DUST-ONLY pipeline: every surviving connected blob above z_thr is kept
+    as a dust candidate if it's big enough (min_area) and round enough
+    (min_circularity); everything else is rejected. (Thread/fiber and glue
+    shape-classification, hysteresis thresholding, and gap-bridging were
+    removed to keep this simple and fast -- re-add them later if/when
+    those defect types need to come back.)
 
     If the app has been calibrated (mm_per_px set via two-point calibration),
-    sizes are also reported in mm; anything under min_diameter_mm (for dust)
-    is rejected too. Without calibration this step is skipped.
+    sizes are also reported in mm; anything under min_diameter_mm is
+    rejected too. Without calibration this step is skipped.
 
     Returns (binary, blobs, stats, debug_images). binary is the cleaned
-    mask; blobs is a list of classified blob dicts (each with "type":
-    "dust"/"thread"/"glue", position, size, and a ready-to-draw "label"
-    string); stats is summary counts. debug_images is None unless
-    debug=True, in which case it's an ordered dict of intermediate
-    pipeline images (grayscale, z-score heatmap, raw threshold, after
-    gap-bridging, final classified result) for the pipeline-steps viewer.
+    mask; blobs is a list of dust blob dicts (position, size, and a
+    ready-to-draw "label" string); stats is summary counts. debug_images
+    is None unless debug=True, in which case it's an ordered dict of
+    intermediate pipeline images (grayscale, z-score heatmap, threshold,
+    final classified result) for the pipeline-steps viewer.
     """
     win = window if window % 2 == 1 else window + 1
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -396,138 +342,53 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
     for roi in rois:
         cv2.circle(mask, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), 255, -1)
 
-    # Hysteresis thresholding (same idea as Canny edge detection): a pixel
-    # only needs to clear the LOW bar if it's connected to at least one
-    # pixel that clears the FULL z_thr bar. A real thread's contrast often
-    # fades along its length -- the z-score heatmap still shows it clearly
-    # as elevated the whole way, just not always above z_thr. A flat
-    # z_thr >= cutoff would keep only the strong core and drop the faint
-    # tail; hysteresis recovers the whole connected thread as long as some
-    # part of it is strongly above threshold, while still rejecting
-    # isolated weak noise that never touches a strong pixel anywhere.
-    strong = ((zscore >= z_thr) & (mask == 255)).astype(np.uint8)
-    weak = ((zscore >= z_thr_low) & (mask == 255)).astype(np.uint8)
-    _num_labels, weak_labels = cv2.connectedComponents(weak, connectivity=8)
-    strong_label_ids = set(np.unique(weak_labels[strong == 1]))
-    strong_label_ids.discard(0)
-    if strong_label_ids:
-        raw = (np.isin(weak_labels, list(strong_label_ids)) * 255).astype(np.uint8)
-    else:
-        raw = np.zeros_like(weak, dtype=np.uint8)
+    raw = ((zscore >= z_thr) & (mask == 255)).astype(np.uint8) * 255
 
-    # Bridge gaps for CONNECTIVITY ONLY via dilation -- NOT a full closing.
-    # Closing (dilate then erode) turned out to be unreliable here: the
-    # erode half removes a thin bridge just as easily as it would remove
-    # the thread's own thin width, so it often failed to reconnect a
-    # fragmented thread at all. Dilating (no erode) reliably links nearby
-    # fragments; shape is then measured from the ORIGINAL undilated pixels
-    # within each linked region, so linking doesn't inflate the measured
-    # width. (Trade-off: a large gap_bridge_px can also fuse two separate
-    # nearby real defects into one -- tune it to the largest real gap you
-    # see in a fragmented thread, not much more.)
-    # a single dilate with a large kernel is catastrophically slow (a
-    # 301x301 kernel measured 3+ seconds on just a 2000x2000 test frame,
-    # worse on a real full-res camera image) -- iterating a small 3x3
-    # kernel reaches the same effective radius in far less time (~30x
-    # faster measured), with identical connectivity outcomes, since all
-    # that actually matters here is whether two nearby fragments end up
-    # merged, not the exact dilated pixel shape
-    small_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    iterations = max(1, int(round(gap_bridge_px / 2.0)))
-    linked = cv2.dilate(raw, small_kernel, iterations=iterations)
-
-    link_contours, _ = cv2.findContours(linked, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    contours, _ = cv2.findContours(raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     blobs = []
     binary = np.zeros_like(raw)
     rejected = 0
 
-    for lc in link_contours:
+    for c in contours:
+        # Real foreground pixel count, NOT cv2.contourArea(c). contourArea
+        # treats the contour as a filled polygon -- fine for a solid dust
+        # speck, but wrong for a hollow ring: RETR_EXTERNAL only returns
+        # the OUTER boundary of a ring (it doesn't report the inner hole
+        # as a separate contour here), so contourArea would silently treat
+        # a thin bright ring as if it were a solid disc the size of its
+        # outer edge, handing it near-perfect circularity. That's exactly
+        # the false positive this pipeline has to reject: a center
+        # concentric ring/crescent from lens or coating reflection under
+        # the inspection light is a real, physically-fixed optical
+        # artifact, not contamination. Counting only the pixels that
+        # actually crossed z_thr (via the mask, same as the old
+        # hysteresis-era code did) makes a thin ring's true area tiny
+        # relative to its outer perimeter, so its circularity comes out
+        # correctly low and it gets rejected here without needing any
+        # separate ring-specific check.
         region = np.zeros_like(raw)
-        cv2.drawContours(region, [lc], -1, 255, -1)
-        original = cv2.bitwise_and(raw, region)  # hysteresis-recovered pixels -- used for area/length
-        strong_part = cv2.bitwise_and(strong * 255, region)  # strong-only pixels -- used for shape/width/circularity
-        area = int(cv2.countNonZero(original))
+        cv2.drawContours(region, [c], -1, 255, -1)
+        real_pixels = cv2.bitwise_and(raw, region)
+        area = int(cv2.countNonZero(real_pixels))
         if area < min_area:
             rejected += 1
             continue
+        perimeter = cv2.arcLength(c, True)
+        circularity = (4 * np.pi * area / (perimeter * perimeter)) if perimeter > 0 else 0.0
+        if circularity < min_circularity:
+            rejected += 1
+            continue  # not round/solid enough to be a dust speck (rings, crescents, arcs) -- drop
 
-        frag_contours, _ = cv2.findContours(original, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        if not frag_contours:
+        (cx, cy), r = cv2.minEnclosingCircle(c)
+        diameter_px = 2.0 * r
+        diameter_mm = diameter_px * mm_per_px if mm_per_px else None
+        if diameter_mm is not None and diameter_mm < min_diameter_mm:
             rejected += 1
             continue
-        perimeter = sum(cv2.arcLength(fc, True) for fc in frag_contours)
-        length_px = perimeter / 2.0
-
-        # Shape decisions (round vs elongated, width) come from the STRONG
-        # core only, NOT the full hysteresis region. hysteresis's weak
-        # threshold is meant to extend LENGTH/continuity along a faint
-        # tail -- but any weak halo isn't perfectly symmetric or perfectly
-        # thread-width-shaped, so measuring width/circularity off the full
-        # (weak-included) region can inflate a genuinely thin thread's
-        # width past the glue cutoff, or make a genuinely round dust
-        # speck's circularity drop enough to look elongated. Confirmed
-        # with a direct test: a thin (4px) strong core measured 8.4px wide
-        # once its weak halo was included -- right at the glue threshold.
-        strong_contours, _ = cv2.findContours(strong_part, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        strong_area = int(cv2.countNonZero(strong_part))
-        if not strong_contours or strong_area < 1:
-            rejected += 1  # shouldn't normally happen -- a linked region always contains >=1 strong pixel
-            continue
-        strong_perimeter = sum(cv2.arcLength(sc, True) for sc in strong_contours)
-        circularity = (4 * np.pi * strong_area / (strong_perimeter * strong_perimeter)) if strong_perimeter > 0 else 0.0
-
-        if circularity >= min_circularity and len(strong_contours) == 1:
-            # only a genuinely solid single blob counts as dust -- a linked
-            # group of several small fragments is never one dust speck
-            (cx, cy), r = cv2.minEnclosingCircle(strong_contours[0])
-            diameter_px = 2.0 * r
-            diameter_mm = diameter_px * mm_per_px if mm_per_px else None
-            if diameter_mm is not None and diameter_mm < min_diameter_mm:
-                rejected += 1
-                continue
-            label = f"{diameter_mm:.2f}mm" if diameter_mm is not None else f"{diameter_px:.0f}px"
-            blobs.append({"type": "dust", "cx": float(cx), "cy": float(cy), "r": float(max(r, 3.0)),
-                          "diameter_px": float(diameter_px), "diameter_mm": diameter_mm, "label": label})
-            binary = cv2.bitwise_or(binary, original)
-            continue
-
-        # not round -- is it a real elongated shape at all? width from the
-        # strong core only, for the same reason as circularity above.
-        dist = cv2.distanceTransform(strong_part, cv2.DIST_L2, 5)
-        width_px = 2.0 * float(dist.max())
-        if length_px < 1e-6 or (length_px / max(width_px, 1e-6)) < min_aspect_ratio:
-            rejected += 1
-            continue  # neither round nor elongated enough -- ambiguous, drop
-
-        all_pts = np.vstack([fc.reshape(-1, 2) for fc in frag_contours]).astype(np.float64)
-        rcx, rcy = float(all_pts[:, 0].mean()), float(all_pts[:, 1].mean())
-        r_draw = max(length_px / 2.0, 3.0)
-
-        if width_px > max_thin_width_px:
-            btype = "glue"
-        else:
-            is_arc = False
-            if len(all_pts) >= 8:
-                fit_r, resid = _fit_circle(all_pts)
-                if fit_r is not None:
-                    norm_resid = resid / max(length_px, 1e-6)
-                    radius_ratio = fit_r / max(length_px, 1e-6)
-                    if norm_resid <= max_arc_fit_residual and 1.2 <= radius_ratio <= 25.0:
-                        is_arc = True
-            if is_arc:
-                rejected += 1
-                continue  # a clean fit to one circle much bigger than itself -- a real
-                          # optical reflection/rim (fixed lens geometry), not contamination
-            btype = "thread"
-
-        if mm_per_px:
-            label = f"{btype} {length_px * mm_per_px:.2f}x{width_px * mm_per_px:.2f}mm"
-        else:
-            label = f"{btype} {length_px:.0f}x{width_px:.0f}px"
-
-        blobs.append({"type": btype, "cx": rcx, "cy": rcy, "r": float(r_draw),
-                      "length_px": float(length_px), "width_px": float(width_px), "label": label})
-        binary = cv2.bitwise_or(binary, original)
+        label = f"{diameter_mm:.2f}mm" if diameter_mm is not None else f"{diameter_px:.0f}px"
+        blobs.append({"type": "dust", "cx": float(cx), "cy": float(cy), "r": float(max(r, 3.0)),
+                      "diameter_px": float(diameter_px), "diameter_mm": diameter_mm, "label": label})
+        binary = cv2.bitwise_or(binary, real_pixels)
 
     stats = None
     if mask.any():
@@ -543,17 +404,14 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
         z_ceiling = max(z_thr * 3.0, 1.0)
         z_norm = (np.clip(zscore, 0, z_ceiling) / z_ceiling * 255).astype(np.uint8)
         debug_images["2 Z-score heatmap"] = cv2.applyColorMap(z_norm, cv2.COLORMAP_INFERNO)
-        debug_images["3 Weak threshold (context, low bar)"] = cv2.cvtColor(weak * 255, cv2.COLOR_GRAY2BGR)
-        debug_images["4 Strong threshold (z_thr)"] = cv2.cvtColor(strong * 255, cv2.COLOR_GRAY2BGR)
-        debug_images["5 After hysteresis (before bridging)"] = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
-        debug_images["6 After gap-bridging"] = cv2.cvtColor(linked, cv2.COLOR_GRAY2BGR)
+        debug_images["3 Threshold (z_thr)"] = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
         result_disp = bgr.copy()
         for b in blobs:
             cx, cy, r = int(b["cx"]), int(b["cy"]), int(round(b["r"]))
             color = BLOB_COLOR_BGR.get(b["type"], (0, 0, 255))
             cv2.circle(result_disp, (cx, cy), r + 4, color, 2)
             cv2.putText(result_disp, b["label"], (cx + r + 10, cy + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3, cv2.LINE_AA)
-        debug_images["7 Final classified result"] = result_disp
+        debug_images["4 Final classified result"] = result_disp
 
     return binary, blobs, stats, debug_images
 
@@ -790,7 +648,7 @@ class DustInspectorApp:
         self.original = None
         self.using_static_image = False
         self.rois = []                 # active ROI set used by the main window
-        self.last_blobs = []           # last inspection's accepted blobs: dust/thread/glue
+        self.last_blobs = []           # last inspection's accepted dust blobs
         self.inspection_running = False
 
         # teaching-window-only interactive state (ROI editor canvas)
@@ -1317,8 +1175,7 @@ class DustInspectorApp:
         try:
             _binary, blobs, _stats, _dbg = run_zscore_detection(
                 frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
-                s.get("scale_mm_per_px"), s["min_diameter_mm"],
-                s["min_aspect_ratio"], s["max_thin_width_px"], s["max_arc_fit_residual"], s["gap_bridge_px"], s["z_thr_low"])
+                s.get("scale_mm_per_px"), s["min_diameter_mm"])
         except Exception:
             blobs = []
 
@@ -1391,7 +1248,7 @@ class DustInspectorApp:
         counts = {}
         for b in blobs:
             counts[b["type"]] = counts.get(b["type"], 0) + 1
-        lines = [f"- {counts[t]}x {t}" for t in ("dust", "thread", "glue") if counts.get(t)]
+        lines = [f"- {counts[t]}x {t}" for t in ("dust",) if counts.get(t)]
         return "\n".join(lines)
 
     def _finish_inspection(self, blobs, verdict, log_args):
@@ -1569,6 +1426,9 @@ class DustInspectorApp:
             messagebox.showinfo("Assign Camera Labels", "No ROIs yet -- add some first.")
             return
         _ensure_cam_labels(self.rois)  # default-fill so the dialog always starts with something sensible
+        self._render_roi_canvas()  # so the ROI{n} numbers behind the dialog match this dialog's rows right away
+
+        prior_selected = self.selected_idx
 
         dlg = tk.Toplevel(self.root)
         dlg.title("Assign Camera Labels")
@@ -1576,11 +1436,17 @@ class DustInspectorApp:
         dlg.transient(self.root)
         dlg.grab_set()
 
-        ctk.CTkLabel(dlg, text="Assign a camera position to each ROI (e.g. cam1, cam2, ...).",
-                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=16, pady=(14, 8))
+        ctk.CTkLabel(dlg, text="Click a row (or its box) to highlight that exact ROI on the canvas behind this "
+                               "window, then type its camera position (cam1, cam2, ...).",
+                     font=self.f_small, text_color=TEXT_MUTED, wraplength=420, justify="left").pack(
+            anchor="w", padx=16, pady=(14, 8))
 
         rows_frame = ctk.CTkFrame(dlg, fg_color="transparent")
         rows_frame.pack(fill="both", expand=True, padx=16)
+
+        def highlight(i):
+            self.selected_idx = i
+            self._render_roi_canvas()
 
         entries = []
         for i, roi in enumerate(self.rois):
@@ -1589,7 +1455,15 @@ class DustInspectorApp:
             ctk.CTkLabel(row, text=f"ROI {i + 1}  (x={int(roi['cx'])}, y={int(roi['cy'])})",
                          font=self.f_small, text_color=TEXT, width=220, anchor="w").pack(side="left")
             var = tk.StringVar(value=roi.get("cam_label") or f"cam{i + 1}")
-            ctk.CTkEntry(row, textvariable=var, width=100).pack(side="left", padx=(8, 0))
+            entry = ctk.CTkEntry(row, textvariable=var, width=100)
+            entry.pack(side="left", padx=(8, 0))
+            # Focusing the box -- or just clicking its row -- highlights the
+            # matching ROI on the canvas in yellow, the same way clicking an
+            # ROI directly does, so there's no more guessing which entry
+            # belongs to which circle on screen.
+            entry.bind("<FocusIn>", lambda e, i=i: highlight(i))
+            row.bind("<Button-1>", lambda e, i=i: highlight(i))
+            self._btn_secondary(row, "Highlight", lambda i=i: highlight(i), width=90).pack(side="left", padx=(8, 0))
             entries.append(var)
 
         status_var = tk.StringVar(value="")
@@ -1606,14 +1480,23 @@ class DustInspectorApp:
                 return
             for roi, lbl in zip(self.rois, labels):
                 roi["cam_label"] = lbl
+            self.selected_idx = prior_selected
             self._render_roi_canvas()
             self.footer_var.set("Camera labels updated.")
+            dlg.destroy()
+
+        def on_cancel():
+            self.selected_idx = prior_selected
+            self._render_roi_canvas()
             dlg.destroy()
 
         btns = ctk.CTkFrame(dlg, fg_color="transparent")
         btns.pack(fill="x", padx=16, pady=14)
         self._btn_primary(btns, "Save", on_save, width=100).pack(side="left")
-        self._btn_secondary(btns, "Cancel", dlg.destroy, width=100).pack(side="left", padx=(8, 0))
+        self._btn_secondary(btns, "Cancel", on_cancel, width=100).pack(side="left", padx=(8, 0))
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+        if self.rois:
+            highlight(0)
 
     def delete_selected_roi(self):
         if self.selected_idx is not None and 0 <= self.selected_idx < len(self.rois):
@@ -1657,14 +1540,12 @@ class DustInspectorApp:
         threading.Thread(target=self._run_test_detection_thread, args=(frame, rois_snapshot), daemon=True).start()
 
     def _run_test_detection_thread(self, frame, rois_snapshot):
-        """Off the main thread -- a slow setting (e.g. a big gap_bridge_px)
-        must never be able to freeze the UI, no matter what's dialed in."""
+        """Off the main thread so a slow detection pass never freezes the UI."""
         s = self.settings
         try:
             _binary, blobs, stats, _dbg = run_zscore_detection(
                 frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
-                s.get("scale_mm_per_px"), s["min_diameter_mm"],
-                s["min_aspect_ratio"], s["max_thin_width_px"], s["max_arc_fit_residual"], s["gap_bridge_px"], s["z_thr_low"])
+                s.get("scale_mm_per_px"), s["min_diameter_mm"])
         except Exception:
             blobs, stats = [], None
         self.root.after(0, lambda: self._finish_test_detection(blobs, stats))
@@ -1695,9 +1576,7 @@ class DustInspectorApp:
         try:
             _binary, _blobs, _stats, debug_images = run_zscore_detection(
                 frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
-                s.get("scale_mm_per_px"), s["min_diameter_mm"],
-                s["min_aspect_ratio"], s["max_thin_width_px"], s["max_arc_fit_residual"], s["gap_bridge_px"], s["z_thr_low"],
-                debug=True)
+                s.get("scale_mm_per_px"), s["min_diameter_mm"], debug=True)
         except Exception:
             debug_images = None
         self.root.after(0, lambda: self._finish_pipeline_debug(debug_images))
@@ -1772,25 +1651,8 @@ class DustInspectorApp:
         self._field(row2, "Min dust diameter (mm)", self.min_diam_var, width=100).pack(side="left", padx=(0, 16))
 
         row3 = ctk.CTkFrame(card, fg_color="transparent")
-        row3.pack(fill="x", padx=18, pady=(0, 8))
-        self.min_aspect_var = tk.StringVar(value=str(self.settings["min_aspect_ratio"]))
-        self.max_thin_var = tk.StringVar(value=str(self.settings["max_thin_width_px"]))
-        self.arc_fit_var = tk.StringVar(value=str(self.settings["max_arc_fit_residual"]))
-        self._field(row3, "Min elongation ratio", self.min_aspect_var, width=90).pack(side="left", padx=(0, 16))
-        self._field(row3, "Max thread/arc width (px)", self.max_thin_var, width=110).pack(side="left", padx=(0, 16))
-        self._field(row3, "Arc-fit tolerance (0-1)", self.arc_fit_var, width=100).pack(side="left", padx=(0, 16))
-        ctk.CTkLabel(card, text="A thin elongated blob is rejected as an arc (lens/coating reflection) only if it cleanly fits ONE circle much bigger than itself -- a real thread can curve too, but essentially never traces a perfect large arc, so curvature alone no longer disqualifies it. Lower the tolerance to be stricter about what counts as a clean circle fit.",
-                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 8))
-
-        row4 = ctk.CTkFrame(card, fg_color="transparent")
-        row4.pack(fill="x", padx=18, pady=(0, 8))
-        self.gap_bridge_var = tk.StringVar(value=str(self.settings["gap_bridge_px"]))
-        self.z_thr_low_var = tk.StringVar(value=str(self.settings["z_thr_low"]))
-        self._field(row4, "Gap bridge (px)", self.gap_bridge_var, width=90).pack(side="left", padx=(0, 16))
-        self._field(row4, "Weak threshold (hysteresis)", self.z_thr_low_var, width=100).pack(side="left", padx=(0, 16))
-        self._btn_primary(row4, "Save", self._save_detection_settings, width=100).pack(side="left", pady=(18, 0))
-        ctk.CTkLabel(card, text="Two different fixes for a broken-up thread: Weak threshold recovers a FAINT tail that's still elevated in the z-score but below the main threshold (hysteresis: a weak pixel counts if it touches a strong one, same trick Canny edge detection uses). Gap bridge instead links pieces separated by a true GAP with no signal at all -- it can't invent detail hysteresis is the fix when the heatmap actually shows the thread, just not brightly enough everywhere; gap bridge is the fix when there's a real empty stretch in between.",
-                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 14))
+        row3.pack(fill="x", padx=18, pady=(0, 14))
+        self._btn_primary(row3, "Save", self._save_detection_settings, width=100).pack(side="left")
 
     def _save_detection_settings(self):
         try:
@@ -1800,11 +1662,6 @@ class DustInspectorApp:
             self.settings["min_area"] = float(self.min_area_var.get())
             self.settings["min_circularity"] = float(self.min_circ_var.get())
             self.settings["min_diameter_mm"] = float(self.min_diam_var.get())
-            self.settings["min_aspect_ratio"] = float(self.min_aspect_var.get())
-            self.settings["max_thin_width_px"] = float(self.max_thin_var.get())
-            self.settings["max_arc_fit_residual"] = float(self.arc_fit_var.get())
-            self.settings["gap_bridge_px"] = float(self.gap_bridge_var.get())
-            self.settings["z_thr_low"] = float(self.z_thr_low_var.get())
         except ValueError:
             messagebox.showerror("Settings", "All fields must be numbers.")
             return
@@ -2008,9 +1865,19 @@ class DustInspectorApp:
             color = (0, 255, 255) if i == self.selected_idx else (0, 255, 0)
             cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), color, 2)
             cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), 5, color, -1)
-            label_text = roi.get("cam_label") or str(i + 1)
-            cv2.putText(disp, label_text, (int(roi["cx"]) + 10, int(roi["cy"]) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            # Always show BOTH the ROI's on-screen number and its assigned
+            # camera label (e.g. "ROI2: cam2") so the two never need to be
+            # cross-referenced by hand -- this is the same "ROI N" wording
+            # used in the Assign Camera Labels dialog, so a row there maps
+            # straight onto what's drawn here. A filled background box
+            # behind the text keeps it readable over any image content.
+            label_text = f"ROI{i + 1}: {roi.get('cam_label')}" if roi.get("cam_label") else f"ROI{i + 1}: (unlabeled)"
+            font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2
+            (tw, th), baseline = cv2.getTextSize(label_text, font, scale, thick)
+            tx = int(roi["cx"]) + 12
+            ty = int(roi["cy"]) - 12
+            cv2.rectangle(disp, (tx - 4, ty - th - 6), (tx + tw + 4, ty + baseline + 4), (0, 0, 0), -1)
+            cv2.putText(disp, label_text, (tx, ty), font, scale, color, thick, cv2.LINE_AA)
         for b in self.last_blobs:
             cx, cy, r = int(b["cx"]), int(b["cy"]), int(round(b["r"]))
             cv2.circle(disp, (cx, cy), r + 4, BLOB_COLOR_BGR.get(b["type"], (0, 0, 255)), 2)
