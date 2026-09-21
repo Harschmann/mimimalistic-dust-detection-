@@ -1,5 +1,5 @@
 """
-Dust Inspector -- Operator-facing camera dust-detection app
+Dust Inspector Operator-facing camera dust-detection app
 ------------------------------------------------------------
 Single-file desktop app, restructured into TWO windows:
 
