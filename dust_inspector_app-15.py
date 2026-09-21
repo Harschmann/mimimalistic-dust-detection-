@@ -1322,7 +1322,24 @@ class DustInspectorApp:
                 continue
             cam_dir = os.path.join(source_model_dir, roi["cam_label"])
             os.makedirs(cam_dir, exist_ok=True)
-            crop = frame[y0:y1, x0:x1]
+            crop = frame[y0:y1, x0:x1].copy()
+            # Circular crop, not a square bounding-box crop -- the ROI
+            # itself is a circle, so a square crop always carries four
+            # corners of irrelevant background (module housing, other
+            # cameras' edges, glare) that were never actually part of the
+            # camera lens area being inspected. Filled black (actual RGB
+            # zeroed, not just an alpha channel) rather than made
+            # transparent -- an alpha channel is silently dropped by most
+            # image loaders (PIL's convert('RGB'), cv2.imread without
+            # IMREAD_UNCHANGED) including whatever training pipeline reads
+            # these later, so transparency alone wouldn't reliably mask
+            # anything. A flat black corner is the same in every saved
+            # image (fixed camera + jig), so a position-based model
+            # (PatchCore/PaDiM) just learns it as part of the fixed normal
+            # background -- it isn't going to get confused into flagging it.
+            circ_mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+            cv2.circle(circ_mask, (cx - x0, cy - y0), r, 255, -1)
+            crop[circ_mask == 0] = 0
             cv2.imwrite(os.path.join(cam_dir, f"crop_{ts}_{barcode}.png"), crop)
 
         result_disp = source_disp.copy()
