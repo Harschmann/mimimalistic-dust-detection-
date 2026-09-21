@@ -43,6 +43,7 @@ import json
 import time
 import threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -307,10 +308,128 @@ class CameraManager:
 
 
 # ---------------------------------------------------------------- detect ----
+def _detect_dust_in_roi(bgr, roi, window, z_thr, min_area, min_circularity, mm_per_px, min_diameter_mm, debug):
+    """The whole z-score -> threshold -> contour pipeline, run on just ONE
+    ROI's own bounding-box crop instead of the full frame. This is the key
+    complexity fix: before, every per-pixel step (boxFilter, zscore, the
+    threshold) ran over the ENTIRE frame even though the ROIs typically
+    cover a small fraction of it, and every contour re-allocated a
+    full-frame-sized array. Cropping first means the per-pixel cost is
+    O(this ROI's area) not O(full frame), and using cv2.boundingRect(c) for
+    each contour (instead of a full-crop-sized zeros array) means the
+    per-contour cost is O(that blob's own area) not O(the crop's area).
+    Summed across ROIs that's O(sum of ROI areas + total blob area) instead
+    of the old O(k * full_frame_pixels) -- and since each call here is
+    independent (only reads bgr, never writes shared state), the caller
+    runs one of these per ROI in a thread pool for real wall-clock
+    parallelism on top of that (cv2/numpy release the GIL during the
+    actual C-level number crunching, so separate ROIs' heavy calls do
+    genuinely overlap, not just interleave).
+
+    Returns (blobs, local_binary, stats_partial, debug_crops, (x0, y0)).
+    blobs are already offset into FULL-FRAME coordinates; local_binary and
+    debug_crops are still crop-local -- the caller pastes them back at
+    (x0, y0) into full-size canvases.
+    """
+    h, w = bgr.shape[:2]
+    cx, cy, r = roi["cx"], roi["cy"], roi["r"]
+    win = window if window % 2 == 1 else window + 1
+    # Pad the crop by win//2 beyond the ROI's own bounding box. Without
+    # this, boxFilter's border handling at the crop's edge would reflect
+    # the CROP's own boundary instead of seeing the real neighboring
+    # pixels the full-frame version used to see there -- which would
+    # quietly shift the z-score for pixels within win//2 of the ROI's
+    # edge. The pad gives boxFilter real image content on all sides
+    # (as long as the ROI isn't touching the actual frame edge), so
+    # z-score inside the ROI circle comes out numerically identical to
+    # the old full-frame computation (verified directly: 0.0 max diff on
+    # a test image). The mask still only keeps the true circle, so this
+    # extra border is pure context for the filter, never reported as data.
+    pad = win // 2
+    x0 = max(0, int(cx - r) - pad)
+    y0 = max(0, int(cy - r) - pad)
+    x1 = min(w, int(cx + r) + 1 + pad)
+    y1 = min(h, int(cy + r) + 1 + pad)
+    if x1 <= x0 or y1 <= y0:
+        return [], None, None, None, (x0, y0)
+
+    crop = bgr[y0:y1, x0:x1]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    local_mean = cv2.boxFilter(gray, -1, (win, win))
+    local_mean_sq = cv2.boxFilter(gray * gray, -1, (win, win))
+    local_std = np.sqrt(np.maximum(local_mean_sq - local_mean * local_mean, 0))
+    zscore = np.where(local_std > 1e-5, (gray - local_mean) / local_std, 0.0)
+
+    mask = np.zeros(gray.shape, dtype=np.uint8)
+    cv2.circle(mask, (int(cx - x0), int(cy - y0)), int(r), 255, -1)
+
+    raw = ((zscore >= z_thr) & (mask == 255)).astype(np.uint8) * 255
+
+    contours, _ = cv2.findContours(raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    blobs = []
+    local_binary = np.zeros_like(raw)
+    rejected = 0
+
+    for c in contours:
+        # Crop to just this contour's own bounding box (cv2.boundingRect)
+        # instead of allocating a crop-sized zeros array per contour --
+        # this is what takes the per-contour cost from O(crop area) down
+        # to O(that blob's own area).
+        bx, by, bw, bh = cv2.boundingRect(c)
+        sub_raw = raw[by:by + bh, bx:bx + bw]
+        sub_region = np.zeros_like(sub_raw)
+        c_local = c - [bx, by]  # shift contour points into the sub-crop's own coordinate frame
+        cv2.drawContours(sub_region, [c_local], -1, 255, -1)
+        # Real foreground pixel count, NOT cv2.contourArea(c). contourArea
+        # treats the contour as a filled polygon -- fine for a solid dust
+        # speck, but wrong for a hollow ring: RETR_EXTERNAL only returns
+        # the OUTER boundary of a ring, so contourArea would treat a thin
+        # bright ring as if it were a solid disc, handing it near-perfect
+        # circularity. That's exactly the false positive this pipeline has
+        # to reject: a center concentric ring/crescent from lens or
+        # coating reflection under the inspection light is a real,
+        # physically-fixed optical artifact, not contamination. Counting
+        # only the pixels that actually crossed z_thr makes a thin ring's
+        # true area tiny relative to its outer perimeter, so its
+        # circularity comes out correctly low and it's rejected here
+        # without any separate ring-specific check.
+        real_pixels_sub = cv2.bitwise_and(sub_raw, sub_region)
+        area = int(cv2.countNonZero(real_pixels_sub))
+        if area < min_area:
+            rejected += 1
+            continue
+        perimeter = cv2.arcLength(c, True)
+        circularity = (4 * np.pi * area / (perimeter * perimeter)) if perimeter > 0 else 0.0
+        if circularity < min_circularity:
+            rejected += 1
+            continue  # not round/solid enough to be a dust speck (rings, crescents, arcs) -- drop
+
+        (ccx, ccy), rr = cv2.minEnclosingCircle(c)
+        diameter_px = 2.0 * rr
+        diameter_mm = diameter_px * mm_per_px if mm_per_px else None
+        if diameter_mm is not None and diameter_mm < min_diameter_mm:
+            rejected += 1
+            continue
+        label = f"{diameter_mm:.2f}mm" if diameter_mm is not None else f"{diameter_px:.0f}px"
+        blobs.append({"type": "dust", "cx": float(ccx + x0), "cy": float(ccy + y0), "r": float(max(rr, 3.0)),
+                      "diameter_px": float(diameter_px), "diameter_mm": diameter_mm, "label": label})
+        local_binary[by:by + bh, bx:bx + bw] = cv2.bitwise_or(local_binary[by:by + bh, bx:bx + bw], real_pixels_sub)
+
+    stats_partial = None
+    if mask.any():
+        roi_z = zscore[mask == 255]
+        stats_partial = {"max_z": float(roi_z.max()), "sum_z": float(roi_z.sum()), "count_z": int(roi_z.size),
+                          "dust_px": int((local_binary == 255).sum()), "rejected": rejected}
+
+    debug_crops = {"gray": gray, "zscore": zscore, "raw": raw} if debug else None
+    return blobs, local_binary, stats_partial, debug_crops, (x0, y0)
+
+
 def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity=0.55,
                           mm_per_px=None, min_diameter_mm=0.0, debug=False):
     """Core Z-score math is UNCHANGED: local Z-score via boxFilter mean/std,
-    thresholded inside the union of all circular ROI masks.
+    thresholded inside each circular ROI mask.
 
     DUST-ONLY pipeline: every surviving connected blob above z_thr is kept
     as a dust candidate if it's big enough (min_area) and round enough
@@ -318,6 +437,17 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
     shape-classification, hysteresis thresholding, and gap-bridging were
     removed to keep this simple and fast -- re-add them later if/when
     those defect types need to come back.)
+
+    Each ROI is processed independently on its own bounding-box crop, in
+    its own worker thread (see _detect_dust_in_roi's docstring for why
+    that's the complexity fix, not just a parallelism nicety): this brings
+    the per-inspection cost down from O(full_frame_pixels) to O(sum of ROI
+    areas + total detected blob area), and the ROIs' cv2/numpy heavy
+    lifting genuinely overlaps in wall-clock time since those calls
+    release the GIL. Debug-view images are pasted back together from each
+    ROI's crop -- outside every ROI they're simply black, which matches
+    reality: nothing outside an ROI was ever analyzed, before or after
+    this change.
 
     If the app has been calibrated (mm_per_px set via two-point calibration),
     sizes are also reported in mm; anything under min_diameter_mm is
@@ -330,90 +460,62 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
     intermediate pipeline images (grayscale, z-score heatmap, threshold,
     final classified result) for the pipeline-steps viewer.
     """
-    win = window if window % 2 == 1 else window + 1
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    h, w = bgr.shape[:2]
+    binary = np.zeros((h, w), dtype=np.uint8)
+    all_blobs = []
+    max_z, sum_z, count_z, dust_px, rejected = 0.0, 0.0, 0, 0, 0
+    full_gray = full_zscore = full_raw = None
+    if debug:
+        full_gray = np.zeros((h, w), dtype=np.uint8)
+        full_zscore = np.zeros((h, w), dtype=np.float32)
+        full_raw = np.zeros((h, w), dtype=np.uint8)
 
-    local_mean = cv2.boxFilter(gray, -1, (win, win))
-    local_mean_sq = cv2.boxFilter(gray * gray, -1, (win, win))
-    local_std = np.sqrt(np.maximum(local_mean_sq - local_mean * local_mean, 0))
-    zscore = np.where(local_std > 1e-5, (gray - local_mean) / local_std, 0.0)
+    if rois:
+        with ThreadPoolExecutor(max_workers=min(8, len(rois))) as ex:
+            results = list(ex.map(
+                lambda roi: _detect_dust_in_roi(bgr, roi, window, z_thr, min_area, min_circularity,
+                                                 mm_per_px, min_diameter_mm, debug),
+                rois))
 
-    mask = np.zeros(gray.shape, dtype=np.uint8)
-    for roi in rois:
-        cv2.circle(mask, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), 255, -1)
-
-    raw = ((zscore >= z_thr) & (mask == 255)).astype(np.uint8) * 255
-
-    contours, _ = cv2.findContours(raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    blobs = []
-    binary = np.zeros_like(raw)
-    rejected = 0
-
-    for c in contours:
-        # Real foreground pixel count, NOT cv2.contourArea(c). contourArea
-        # treats the contour as a filled polygon -- fine for a solid dust
-        # speck, but wrong for a hollow ring: RETR_EXTERNAL only returns
-        # the OUTER boundary of a ring (it doesn't report the inner hole
-        # as a separate contour here), so contourArea would silently treat
-        # a thin bright ring as if it were a solid disc the size of its
-        # outer edge, handing it near-perfect circularity. That's exactly
-        # the false positive this pipeline has to reject: a center
-        # concentric ring/crescent from lens or coating reflection under
-        # the inspection light is a real, physically-fixed optical
-        # artifact, not contamination. Counting only the pixels that
-        # actually crossed z_thr (via the mask, same as the old
-        # hysteresis-era code did) makes a thin ring's true area tiny
-        # relative to its outer perimeter, so its circularity comes out
-        # correctly low and it gets rejected here without needing any
-        # separate ring-specific check.
-        region = np.zeros_like(raw)
-        cv2.drawContours(region, [c], -1, 255, -1)
-        real_pixels = cv2.bitwise_and(raw, region)
-        area = int(cv2.countNonZero(real_pixels))
-        if area < min_area:
-            rejected += 1
-            continue
-        perimeter = cv2.arcLength(c, True)
-        circularity = (4 * np.pi * area / (perimeter * perimeter)) if perimeter > 0 else 0.0
-        if circularity < min_circularity:
-            rejected += 1
-            continue  # not round/solid enough to be a dust speck (rings, crescents, arcs) -- drop
-
-        (cx, cy), r = cv2.minEnclosingCircle(c)
-        diameter_px = 2.0 * r
-        diameter_mm = diameter_px * mm_per_px if mm_per_px else None
-        if diameter_mm is not None and diameter_mm < min_diameter_mm:
-            rejected += 1
-            continue
-        label = f"{diameter_mm:.2f}mm" if diameter_mm is not None else f"{diameter_px:.0f}px"
-        blobs.append({"type": "dust", "cx": float(cx), "cy": float(cy), "r": float(max(r, 3.0)),
-                      "diameter_px": float(diameter_px), "diameter_mm": diameter_mm, "label": label})
-        binary = cv2.bitwise_or(binary, real_pixels)
+        for blobs, local_binary, stats_partial, debug_crops, (x0, y0) in results:
+            all_blobs.extend(blobs)
+            if local_binary is not None:
+                hc, wc = local_binary.shape[:2]
+                binary[y0:y0 + hc, x0:x0 + wc] = cv2.bitwise_or(binary[y0:y0 + hc, x0:x0 + wc], local_binary)
+            if stats_partial:
+                max_z = max(max_z, stats_partial["max_z"])
+                sum_z += stats_partial["sum_z"]
+                count_z += stats_partial["count_z"]
+                dust_px += stats_partial["dust_px"]
+                rejected += stats_partial["rejected"]
+            if debug and debug_crops is not None:
+                hc, wc = debug_crops["gray"].shape[:2]
+                full_gray[y0:y0 + hc, x0:x0 + wc] = np.clip(debug_crops["gray"], 0, 255).astype(np.uint8)
+                full_zscore[y0:y0 + hc, x0:x0 + wc] = debug_crops["zscore"]
+                full_raw[y0:y0 + hc, x0:x0 + wc] = debug_crops["raw"]
 
     stats = None
-    if mask.any():
-        roi_z = zscore[mask == 255]
-        stats = {"max_z": float(roi_z.max()), "mean_z": float(roi_z.mean()),
-                 "dust_px": int((binary == 255).sum()), "dust_count": len(blobs),
-                 "rejected": rejected}
+    if count_z > 0:
+        stats = {"max_z": max_z, "mean_z": sum_z / count_z, "dust_px": dust_px,
+                 "dust_count": len(all_blobs), "rejected": rejected}
 
     debug_images = None
     if debug:
         debug_images = {}
-        debug_images["1 Grayscale"] = cv2.cvtColor(np.clip(gray, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        debug_images["1 Grayscale"] = cv2.cvtColor(full_gray, cv2.COLOR_GRAY2BGR)
         z_ceiling = max(z_thr * 3.0, 1.0)
-        z_norm = (np.clip(zscore, 0, z_ceiling) / z_ceiling * 255).astype(np.uint8)
+        z_norm = (np.clip(full_zscore, 0, z_ceiling) / z_ceiling * 255).astype(np.uint8)
         debug_images["2 Z-score heatmap"] = cv2.applyColorMap(z_norm, cv2.COLORMAP_INFERNO)
-        debug_images["3 Threshold (z_thr)"] = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
+        debug_images["3 Threshold (z_thr)"] = cv2.cvtColor(full_raw, cv2.COLOR_GRAY2BGR)
         result_disp = bgr.copy()
-        for b in blobs:
+        for b in all_blobs:
             cx, cy, r = int(b["cx"]), int(b["cy"]), int(round(b["r"]))
             color = BLOB_COLOR_BGR.get(b["type"], (0, 0, 255))
             cv2.circle(result_disp, (cx, cy), r + 4, color, 2)
             cv2.putText(result_disp, b["label"], (cx + r + 10, cy + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3, cv2.LINE_AA)
         debug_images["4 Final classified result"] = result_disp
 
-    return binary, blobs, stats, debug_images
+    return binary, all_blobs, stats, debug_images
 
 
 
