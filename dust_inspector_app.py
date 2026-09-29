@@ -19,8 +19,8 @@ Single-file desktop app, restructured into TWO windows:
      ROI placement + two-point calibration (the one interactive canvas
      in the whole app), detection parameters, and camera settings.
 
-Single-threaded detection call per inspection (dust/thread/glue
-classification via run_zscore_detection), still run on a background
+Single-threaded detection call per inspection (dust-only detection via
+run_zscore_detection), still run on a background
 thread so the UI/feed never freezes. (Vinyl/lamination-film detection --
 detect_vinyl_presence -- is implemented below but not currently wired
 into the active inspection flow; re-enable later once the fiber/thread
@@ -43,6 +43,7 @@ import json
 import time
 import threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -56,6 +57,17 @@ try:
     PYLON_AVAILABLE = True
 except Exception:
     PYLON_AVAILABLE = False
+
+try:
+    # Deliberately onnxruntime, NOT anomalib/torch -- Training Studio's own
+    # docstring already says training happens on a different, more capable
+    # machine than the operator's PC. The operator app only needs to RUN an
+    # already-trained model, and ONNX Runtime is the lightweight way to do
+    # that without pulling the ~2GB torch/anomalib stack onto the line PC.
+    import onnxruntime as ort
+    ONNXRUNTIME_AVAILABLE = True
+except Exception:
+    ONNXRUNTIME_AVAILABLE = False
 
 ctk.set_appearance_mode("dark")
 
@@ -80,13 +92,14 @@ VINYL_COLOR = "#a855f7"  # distinct from PASS/FAIL/IN-PROGRESS so it reads as it
 
 # BGR (for cv2 drawing, not the hex UI colors above) per defect type
 BLOB_COLOR_BGR = {
-    "dust": (0, 0, 255),      # red
-    "thread": (0, 165, 255),  # amber
-    "glue": (255, 0, 255),    # magenta
-    "scratch": (255, 255, 0), # cyan
-    "pit": (255, 128, 0),     # azure blue
+    "dust": (0, 0, 255),        # red
+    "ai_anomaly": (0, 165, 255),  # orange -- visually distinct from the z-score dust red
 }
-VINYL_COLOR_BGR = (245, 85, 168)  # pink-purple, kept distinct from glue's magenta
+
+# Test Detection's mode toggle -- internal setting value <-> dropdown text.
+TEST_MODE_TO_DISPLAY = {"opencv": "OpenCV only", "ai": "AI only", "both": "Both (combined)"}
+DISPLAY_TO_TEST_MODE = {v: k for k, v in TEST_MODE_TO_DISPLAY.items()}
+VINYL_COLOR_BGR = (245, 85, 168)  # pink-purple
 
 # ---------------------------------------------------------------- storage --
 if getattr(sys, "frozen", False):
@@ -96,20 +109,99 @@ if getattr(sys, "frozen", False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STORAGE_DIR = os.path.join(BASE_DIR, "storage")
-SOURCE_DIR = os.path.join(STORAGE_DIR, "source_images")
-RESULTS_DIR = os.path.join(STORAGE_DIR, "results")
-RESULTS_NG_DIR = os.path.join(RESULTS_DIR, "NG")
-RESULTS_OK_DIR = os.path.join(RESULTS_DIR, "OK")
-RESULTS_VINYL_DIR = os.path.join(RESULTS_DIR, "VINYL")
-ROI_DIR = os.path.join(STORAGE_DIR, "roi_configs")
-LOGS_DIR = os.path.join(STORAGE_DIR, "logs")
-LOG_CSV_PATH = os.path.join(LOGS_DIR, "inspection_log.csv")
-SETTINGS_PATH = os.path.join(STORAGE_DIR, "settings.json")
 
-for _d in (STORAGE_DIR, SOURCE_DIR, RESULTS_DIR, RESULTS_NG_DIR, RESULTS_OK_DIR,
-           RESULTS_VINYL_DIR, ROI_DIR, LOGS_DIR):
-    os.makedirs(_d, exist_ok=True)
+# settings.json always lives here, right next to the exe/script -- fixed,
+# NOT inside the storage folder below, since that folder's location is
+# user-configurable (Teaching > Camera > Select Location) and settings.json
+# is exactly what remembers which location the user picked. If it lived
+# inside the folder it points to, moving that folder would make the app
+# forget where it moved to.
+SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
+
+STORAGE_DIR = SOURCE_DIR = RESULTS_DIR = RESULTS_NG_DIR = RESULTS_OK_DIR = None
+RESULTS_VINYL_DIR = ROI_DIR = LOGS_DIR = LOG_CSV_PATH = None
+
+
+def _apply_storage_base(base_path):
+    """(Re)points every storage sub-path at base_path and ensures the
+    folder structure exists there. Called once at startup with the default
+    (or a previously-saved custom) location, and again any time the user
+    picks a new folder via Select Location."""
+    global STORAGE_DIR, SOURCE_DIR, RESULTS_DIR, RESULTS_NG_DIR, RESULTS_OK_DIR
+    global RESULTS_VINYL_DIR, ROI_DIR, LOGS_DIR, LOG_CSV_PATH
+    STORAGE_DIR = base_path
+    SOURCE_DIR = os.path.join(STORAGE_DIR, "source_images")
+    RESULTS_DIR = os.path.join(STORAGE_DIR, "results")
+    RESULTS_NG_DIR = os.path.join(RESULTS_DIR, "NG")
+    RESULTS_OK_DIR = os.path.join(RESULTS_DIR, "OK")
+    RESULTS_VINYL_DIR = os.path.join(RESULTS_DIR, "VINYL")
+    ROI_DIR = os.path.join(STORAGE_DIR, "roi_configs")
+    LOGS_DIR = os.path.join(STORAGE_DIR, "logs")
+    LOG_CSV_PATH = os.path.join(LOGS_DIR, "inspection_log.csv")
+    for _d in (STORAGE_DIR, SOURCE_DIR, RESULTS_DIR, RESULTS_NG_DIR, RESULTS_OK_DIR,
+               RESULTS_VINYL_DIR, ROI_DIR, LOGS_DIR):
+        os.makedirs(_d, exist_ok=True)
+
+
+_apply_storage_base(os.path.join(BASE_DIR, "storage"))  # default -- overridden below if the user picked a custom one
+
+
+def _ensure_cam_labels(rois):
+    """Guarantees every ROI dict has a non-empty, unique 'cam_label'
+    (cam1, cam2, ...). Existing labels are kept as-is; only missing/blank/
+    duplicate ones are (re)assigned, by ROI order, to the next label not
+    already used. This is what makes an older/pre-labeling ROI layout
+    (saved before this feature existed) load and "just work" -- it gets
+    cam1..camN assigned by creation order the first time it's touched,
+    instead of erroring or leaving ROIs unlabeled."""
+    used = set()
+    for roi in rois:
+        lbl = (roi.get("cam_label") or "").strip()
+        if lbl and lbl not in used:
+            used.add(lbl)
+        else:
+            roi["cam_label"] = None
+    n = 1
+    for roi in rois:
+        if not roi.get("cam_label"):
+            while f"cam{n}" in used:
+                n += 1
+            roi["cam_label"] = f"cam{n}"
+            used.add(f"cam{n}")
+    return rois
+
+
+def crop_circular(frame, roi):
+    """Collector-mode helper: same convention as the training-crop code
+    used elsewhere in this file (tight bounding box around the ROI circle,
+    everything outside the circle painted black) -- factored out here so
+    Collector mode can reuse it without duplicating the inline version
+    that _save_inspection_artifacts/test-detection build for themselves.
+    Returns None if the ROI falls entirely outside the frame."""
+    h, w = frame.shape[:2]
+    cx, cy, r = int(roi["cx"]), int(roi["cy"]), int(roi["r"])
+    x0, y0 = max(cx - r, 0), max(cy - r, 0)
+    x1, y1 = min(cx + r, w), min(cy + r, h)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    crop = frame[y0:y1, x0:x1].copy()
+    mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+    cv2.circle(mask, (cx - x0, cy - y0), r, 255, -1)
+    crop[mask == 0] = 0
+    return crop
+
+
+def _safe_folder_name(name):
+    """Sanitizes a model/line name for use as a folder name -- falls back
+    to 'UNSPECIFIED' if it's empty so images never get lost by silently
+    landing outside the model-labeled tree."""
+    name = (name or "").strip()
+    if not name:
+        return "UNSPECIFIED"
+    keep = "-_.() "
+    cleaned = "".join(c if (c.isalnum() or c in keep) else "_" for c in name)
+    return cleaned.strip() or "UNSPECIFIED"
+
 
 DEFAULT_SETTINGS = {
     "window": 100,
@@ -121,26 +213,20 @@ DEFAULT_SETTINGS = {
     "min_area": 4.0,
     "min_circularity": 0.55,
     "min_diameter_mm": 0.1,
-    "min_aspect_ratio": 3.0,
-    "max_thin_width_px": 8.0,
-    "max_arc_fit_residual": 0.12,
-    "gap_bridge_px": 11.0,
-    "z_thr_low": 1.5,
     "vinyl_tolerance_px": 15.0,
     "vinyl_strength_thr": 6.0,
-    "scratch_enabled": True,
-    "scratch_aniso_thresh": 170,
-    "scratch_min_length_px": 18.0,
-    "scratch_max_gap_px": 6.0,
-    "scratch_hough_thresh": 16,
-    "pit_enabled": True,
-    "pit_bin_thresh": 28,
-    "pit_min_area_px": 4.0,
-    "pit_kernel_small": 11,
-    "pit_kernel_large": 19,
     "model_name": "",
     "line_name": "",
     "active_roi_name": None,
+    "storage_base_path": None,
+    "ai_enabled": False,          # off by default -- z-score-only behavior is unchanged until a technician opts in
+    "ai_model_paths": {},         # "<model_name>::<cam_label>" -> path to that camera's trained .onnx file
+    "ai_thresholds": {},          # "<model_name>::<cam_label>" -> manual anomaly-score threshold override
+    "test_mode": "opencv",        # Test Detection-only toggle: "opencv" | "ai" | "both" -- doesn't touch live inspection (Start), which always runs both when AI is enabled
+    "collector_save_root": None,          # base folder for Collector mode -- <root>/<Model>/<camN>/good|defect/
+    "collector_duplicate_check": True,
+    "collector_duplicate_threshold": 2.0,  # mean abs pixel diff (0-255) below which a Collector capture counts as a duplicate
+    "collector_counts": {},               # "<model>||<cam_label>||<good|defect>" -> int, persisted across restarts
 }
 
 
@@ -266,78 +352,53 @@ class CameraManager:
 
 
 # ---------------------------------------------------------------- detect ----
-def _fit_circle(pts):
-    """Algebraic (Kasa) least-squares circle fit through a set of 2D
-    points. Returns (radius, rms_residual) -- residual is how far the
-    points typically sit from that best-fit circle (0 = perfect fit).
-    Returns (None, None) if the fit is degenerate."""
-    x, y = pts[:, 0], pts[:, 1]
-    A = np.column_stack([2 * x, 2 * y, np.ones(len(x))])
-    b = x ** 2 + y ** 2
-    try:
-        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
-    except Exception:
-        return None, None
-    a_c, b_c, c = sol
-    r2 = c + a_c ** 2 + b_c ** 2
-    if r2 <= 0:
-        return None, None
-    r = np.sqrt(r2)
-    dists = np.sqrt((x - a_c) ** 2 + (y - b_c) ** 2)
-    resid = float(np.sqrt(np.mean((dists - r) ** 2)))
-    return float(r), resid
+def _detect_dust_in_roi(bgr, roi, window, z_thr, min_area, min_circularity, mm_per_px, min_diameter_mm, debug):
+    """The whole z-score -> threshold -> contour pipeline, run on just ONE
+    ROI's own bounding-box crop instead of the full frame. This is the key
+    complexity fix: before, every per-pixel step (boxFilter, zscore, the
+    threshold) ran over the ENTIRE frame even though the ROIs typically
+    cover a small fraction of it, and every contour re-allocated a
+    full-frame-sized array. Cropping first means the per-pixel cost is
+    O(this ROI's area) not O(full frame), and using cv2.boundingRect(c) for
+    each contour (instead of a full-crop-sized zeros array) means the
+    per-contour cost is O(that blob's own area) not O(the crop's area).
+    Summed across ROIs that's O(sum of ROI areas + total blob area) instead
+    of the old O(k * full_frame_pixels) -- and since each call here is
+    independent (only reads bgr, never writes shared state), the caller
+    runs one of these per ROI in a thread pool for real wall-clock
+    parallelism on top of that (cv2/numpy release the GIL during the
+    actual C-level number crunching, so separate ROIs' heavy calls do
+    genuinely overlap, not just interleave).
 
-
-
-def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity=0.55,
-                          mm_per_px=None, min_diameter_mm=0.0,
-                          min_aspect_ratio=3.0, max_thin_width_px=8.0, max_arc_fit_residual=0.12,
-                          gap_bridge_px=7.0, z_thr_low=1.5, debug=False):
-    """Core Z-score math is UNCHANGED: local Z-score via boxFilter mean/std,
-    thresholded inside the union of all circular ROI masks.
-
-    Every surviving connected blob is then classified by SHAPE:
-      - round + big + circular enough                          -> DUST
-      - elongated (length/width >= min_aspect_ratio), thin
-        (width <= max_thin_width_px), and its points do NOT fit
-        a large circle well                                     -> THREAD/FIBER
-      - elongated + thin AND its points cleanly fit a circle
-        much bigger than itself                                 -> ARC, rejected
-      - elongated + wide (width > max_thin_width_px)            -> GLUE
-
-    Why fit-to-a-circle instead of just "is it curved": a real optical
-    reflection or lens/coating edge is a segment of one PHYSICALLY FIXED
-    circle (the lens/module geometry), so it fits a single circle almost
-    perfectly. A real thread that fell and landed on the module can bend
-    into pretty much any shape -- but it essentially never happens to
-    trace a clean arc of one big fixed-radius circle. So "is this shape
-    curved" is the wrong question (a real thread is very often curved
-    too); "does this shape trace a genuine large circle" is the right one,
-    and that's what's tested here, on the actual contour points -- not on
-    a straight bounding-box proxy, which breaks down for curved shapes.
-
-    This replaced an earlier blanket morphological opening: that approach
-    reliably erased thin curved lens/reflection arcs, but it also erased
-    genuinely thin thread/fiber contamination, since both are "thin"
-    shapes geometrically -- one blunt filter can't tell them apart. A
-    light CLOSING is used instead (bridges tiny gaps in a thin shape's
-    raw mask, never erases it), and classification happens by shape
-    afterwards, on the whole contour.
-
-    If the app has been calibrated (mm_per_px set via two-point calibration),
-    sizes are also reported in mm; anything under min_diameter_mm (for dust)
-    is rejected too. Without calibration this step is skipped.
-
-    Returns (binary, blobs, stats, debug_images). binary is the cleaned
-    mask; blobs is a list of classified blob dicts (each with "type":
-    "dust"/"thread"/"glue", position, size, and a ready-to-draw "label"
-    string); stats is summary counts. debug_images is None unless
-    debug=True, in which case it's an ordered dict of intermediate
-    pipeline images (grayscale, z-score heatmap, raw threshold, after
-    gap-bridging, final classified result) for the pipeline-steps viewer.
+    Returns (blobs, local_binary, stats_partial, debug_crops, (x0, y0)).
+    blobs are already offset into FULL-FRAME coordinates; local_binary and
+    debug_crops are still crop-local -- the caller pastes them back at
+    (x0, y0) into full-size canvases.
     """
+    h, w = bgr.shape[:2]
+    cx, cy, r = roi["cx"], roi["cy"], roi["r"]
     win = window if window % 2 == 1 else window + 1
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    # Pad the crop by win//2 beyond the ROI's own bounding box. Without
+    # this, boxFilter's border handling at the crop's edge would reflect
+    # the CROP's own boundary instead of seeing the real neighboring
+    # pixels the full-frame version used to see there -- which would
+    # quietly shift the z-score for pixels within win//2 of the ROI's
+    # edge. The pad gives boxFilter real image content on all sides
+    # (as long as the ROI isn't touching the actual frame edge), so
+    # z-score inside the ROI circle comes out numerically identical to
+    # the old full-frame computation (verified directly: 0.0 max diff on
+    # a test image). The mask still only keeps the true circle, so this
+    # extra border is pure context for the filter, never reported as data.
+    pad = win // 2
+    x0 = max(0, int(cx - r) - pad)
+    y0 = max(0, int(cy - r) - pad)
+    x1 = min(w, int(cx + r) + 1 + pad)
+    y1 = min(h, int(cy + r) + 1 + pad)
+    if x1 <= x0 or y1 <= y0:
+        return [], None, None, None, (x0, y0)
+
+    crop = bgr[y0:y1, x0:x1]
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
     local_mean = cv2.boxFilter(gray, -1, (win, win))
     local_mean_sq = cv2.boxFilter(gray * gray, -1, (win, win))
@@ -345,332 +406,160 @@ def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity
     zscore = np.where(local_std > 1e-5, (gray - local_mean) / local_std, 0.0)
 
     mask = np.zeros(gray.shape, dtype=np.uint8)
-    for roi in rois:
-        cv2.circle(mask, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), 255, -1)
+    cv2.circle(mask, (int(cx - x0), int(cy - y0)), int(r), 255, -1)
 
-    # Hysteresis thresholding (same idea as Canny edge detection): a pixel
-    # only needs to clear the LOW bar if it's connected to at least one
-    # pixel that clears the FULL z_thr bar. A real thread's contrast often
-    # fades along its length -- the z-score heatmap still shows it clearly
-    # as elevated the whole way, just not always above z_thr. A flat
-    # z_thr >= cutoff would keep only the strong core and drop the faint
-    # tail; hysteresis recovers the whole connected thread as long as some
-    # part of it is strongly above threshold, while still rejecting
-    # isolated weak noise that never touches a strong pixel anywhere.
-    strong = ((zscore >= z_thr) & (mask == 255)).astype(np.uint8)
-    weak = ((zscore >= z_thr_low) & (mask == 255)).astype(np.uint8)
-    _num_labels, weak_labels = cv2.connectedComponents(weak, connectivity=8)
-    strong_label_ids = set(np.unique(weak_labels[strong == 1]))
-    strong_label_ids.discard(0)
-    if strong_label_ids:
-        raw = (np.isin(weak_labels, list(strong_label_ids)) * 255).astype(np.uint8)
-    else:
-        raw = np.zeros_like(weak, dtype=np.uint8)
+    raw = ((zscore >= z_thr) & (mask == 255)).astype(np.uint8) * 255
 
-    # Bridge gaps for CONNECTIVITY ONLY via dilation -- NOT a full closing.
-    # Closing (dilate then erode) turned out to be unreliable here: the
-    # erode half removes a thin bridge just as easily as it would remove
-    # the thread's own thin width, so it often failed to reconnect a
-    # fragmented thread at all. Dilating (no erode) reliably links nearby
-    # fragments; shape is then measured from the ORIGINAL undilated pixels
-    # within each linked region, so linking doesn't inflate the measured
-    # width. (Trade-off: a large gap_bridge_px can also fuse two separate
-    # nearby real defects into one -- tune it to the largest real gap you
-    # see in a fragmented thread, not much more.)
-    # a single dilate with a large kernel is catastrophically slow (a
-    # 301x301 kernel measured 3+ seconds on just a 2000x2000 test frame,
-    # worse on a real full-res camera image) -- iterating a small 3x3
-    # kernel reaches the same effective radius in far less time (~30x
-    # faster measured), with identical connectivity outcomes, since all
-    # that actually matters here is whether two nearby fragments end up
-    # merged, not the exact dilated pixel shape
-    small_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    iterations = max(1, int(round(gap_bridge_px / 2.0)))
-    linked = cv2.dilate(raw, small_kernel, iterations=iterations)
-
-    link_contours, _ = cv2.findContours(linked, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    contours, _ = cv2.findContours(raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     blobs = []
-    binary = np.zeros_like(raw)
+    local_binary = np.zeros_like(raw)
     rejected = 0
 
-    for lc in link_contours:
-        region = np.zeros_like(raw)
-        cv2.drawContours(region, [lc], -1, 255, -1)
-        original = cv2.bitwise_and(raw, region)  # hysteresis-recovered pixels -- used for area/length
-        strong_part = cv2.bitwise_and(strong * 255, region)  # strong-only pixels -- used for shape/width/circularity
-        area = int(cv2.countNonZero(original))
+    for c in contours:
+        # Crop to just this contour's own bounding box (cv2.boundingRect)
+        # instead of allocating a crop-sized zeros array per contour --
+        # this is what takes the per-contour cost from O(crop area) down
+        # to O(that blob's own area).
+        bx, by, bw, bh = cv2.boundingRect(c)
+        sub_raw = raw[by:by + bh, bx:bx + bw]
+        sub_region = np.zeros_like(sub_raw)
+        c_local = c - [bx, by]  # shift contour points into the sub-crop's own coordinate frame
+        cv2.drawContours(sub_region, [c_local], -1, 255, -1)
+        # Real foreground pixel count, NOT cv2.contourArea(c). contourArea
+        # treats the contour as a filled polygon -- fine for a solid dust
+        # speck, but wrong for a hollow ring: RETR_EXTERNAL only returns
+        # the OUTER boundary of a ring, so contourArea would treat a thin
+        # bright ring as if it were a solid disc, handing it near-perfect
+        # circularity. That's exactly the false positive this pipeline has
+        # to reject: a center concentric ring/crescent from lens or
+        # coating reflection under the inspection light is a real,
+        # physically-fixed optical artifact, not contamination. Counting
+        # only the pixels that actually crossed z_thr makes a thin ring's
+        # true area tiny relative to its outer perimeter, so its
+        # circularity comes out correctly low and it's rejected here
+        # without any separate ring-specific check.
+        real_pixels_sub = cv2.bitwise_and(sub_raw, sub_region)
+        area = int(cv2.countNonZero(real_pixels_sub))
         if area < min_area:
             rejected += 1
             continue
+        perimeter = cv2.arcLength(c, True)
+        circularity = (4 * np.pi * area / (perimeter * perimeter)) if perimeter > 0 else 0.0
+        if circularity < min_circularity:
+            rejected += 1
+            continue  # not round/solid enough to be a dust speck (rings, crescents, arcs) -- drop
 
-        frag_contours, _ = cv2.findContours(original, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        if not frag_contours:
+        (ccx, ccy), rr = cv2.minEnclosingCircle(c)
+        diameter_px = 2.0 * rr
+        diameter_mm = diameter_px * mm_per_px if mm_per_px else None
+        if diameter_mm is not None and diameter_mm < min_diameter_mm:
             rejected += 1
             continue
-        perimeter = sum(cv2.arcLength(fc, True) for fc in frag_contours)
-        length_px = perimeter / 2.0
+        label = f"{diameter_mm:.2f}mm" if diameter_mm is not None else f"{diameter_px:.0f}px"
+        blobs.append({"type": "dust", "cx": float(ccx + x0), "cy": float(ccy + y0), "r": float(max(rr, 3.0)),
+                      "diameter_px": float(diameter_px), "diameter_mm": diameter_mm, "label": label})
+        local_binary[by:by + bh, bx:bx + bw] = cv2.bitwise_or(local_binary[by:by + bh, bx:bx + bw], real_pixels_sub)
 
-        # Shape decisions (round vs elongated, width) come from the STRONG
-        # core only, NOT the full hysteresis region. hysteresis's weak
-        # threshold is meant to extend LENGTH/continuity along a faint
-        # tail -- but any weak halo isn't perfectly symmetric or perfectly
-        # thread-width-shaped, so measuring width/circularity off the full
-        # (weak-included) region can inflate a genuinely thin thread's
-        # width past the glue cutoff, or make a genuinely round dust
-        # speck's circularity drop enough to look elongated. Confirmed
-        # with a direct test: a thin (4px) strong core measured 8.4px wide
-        # once its weak halo was included -- right at the glue threshold.
-        strong_contours, _ = cv2.findContours(strong_part, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        strong_area = int(cv2.countNonZero(strong_part))
-        if not strong_contours or strong_area < 1:
-            rejected += 1  # shouldn't normally happen -- a linked region always contains >=1 strong pixel
-            continue
-        strong_perimeter = sum(cv2.arcLength(sc, True) for sc in strong_contours)
-        circularity = (4 * np.pi * strong_area / (strong_perimeter * strong_perimeter)) if strong_perimeter > 0 else 0.0
-
-        if circularity >= min_circularity and len(strong_contours) == 1:
-            # only a genuinely solid single blob counts as dust -- a linked
-            # group of several small fragments is never one dust speck
-            (cx, cy), r = cv2.minEnclosingCircle(strong_contours[0])
-            diameter_px = 2.0 * r
-            diameter_mm = diameter_px * mm_per_px if mm_per_px else None
-            if diameter_mm is not None and diameter_mm < min_diameter_mm:
-                rejected += 1
-                continue
-            label = f"{diameter_mm:.2f}mm" if diameter_mm is not None else f"{diameter_px:.0f}px"
-            blobs.append({"type": "dust", "cx": float(cx), "cy": float(cy), "r": float(max(r, 3.0)),
-                          "diameter_px": float(diameter_px), "diameter_mm": diameter_mm, "label": label})
-            binary = cv2.bitwise_or(binary, original)
-            continue
-
-        # not round -- is it a real elongated shape at all? width from the
-        # strong core only, for the same reason as circularity above.
-        dist = cv2.distanceTransform(strong_part, cv2.DIST_L2, 5)
-        width_px = 2.0 * float(dist.max())
-        if length_px < 1e-6 or (length_px / max(width_px, 1e-6)) < min_aspect_ratio:
-            rejected += 1
-            continue  # neither round nor elongated enough -- ambiguous, drop
-
-        all_pts = np.vstack([fc.reshape(-1, 2) for fc in frag_contours]).astype(np.float64)
-        rcx, rcy = float(all_pts[:, 0].mean()), float(all_pts[:, 1].mean())
-        r_draw = max(length_px / 2.0, 3.0)
-
-        if width_px > max_thin_width_px:
-            btype = "glue"
-        else:
-            is_arc = False
-            if len(all_pts) >= 8:
-                fit_r, resid = _fit_circle(all_pts)
-                if fit_r is not None:
-                    norm_resid = resid / max(length_px, 1e-6)
-                    radius_ratio = fit_r / max(length_px, 1e-6)
-                    if norm_resid <= max_arc_fit_residual and 1.2 <= radius_ratio <= 25.0:
-                        is_arc = True
-            if is_arc:
-                rejected += 1
-                continue  # a clean fit to one circle much bigger than itself -- a real
-                          # optical reflection/rim (fixed lens geometry), not contamination
-            btype = "thread"
-
-        if mm_per_px:
-            label = f"{btype} {length_px * mm_per_px:.2f}x{width_px * mm_per_px:.2f}mm"
-        else:
-            label = f"{btype} {length_px:.0f}x{width_px:.0f}px"
-
-        blobs.append({"type": btype, "cx": rcx, "cy": rcy, "r": float(r_draw),
-                      "length_px": float(length_px), "width_px": float(width_px), "label": label})
-        binary = cv2.bitwise_or(binary, original)
-
-    stats = None
+    stats_partial = None
     if mask.any():
         roi_z = zscore[mask == 255]
-        stats = {"max_z": float(roi_z.max()), "mean_z": float(roi_z.mean()),
-                 "dust_px": int((binary == 255).sum()), "dust_count": len(blobs),
-                 "rejected": rejected}
+        stats_partial = {"max_z": float(roi_z.max()), "sum_z": float(roi_z.sum()), "count_z": int(roi_z.size),
+                          "dust_px": int((local_binary == 255).sum()), "rejected": rejected}
+
+    debug_crops = {"gray": gray, "zscore": zscore, "raw": raw} if debug else None
+    return blobs, local_binary, stats_partial, debug_crops, (x0, y0)
+
+
+def run_zscore_detection(bgr, rois, window, z_thr, min_area=4.0, min_circularity=0.55,
+                          mm_per_px=None, min_diameter_mm=0.0, debug=False):
+    """Core Z-score math is UNCHANGED: local Z-score via boxFilter mean/std,
+    thresholded inside each circular ROI mask.
+
+    DUST-ONLY pipeline: every surviving connected blob above z_thr is kept
+    as a dust candidate if it's big enough (min_area) and round enough
+    (min_circularity); everything else is rejected. (Thread/fiber and glue
+    shape-classification, hysteresis thresholding, and gap-bridging were
+    removed to keep this simple and fast -- re-add them later if/when
+    those defect types need to come back.)
+
+    Each ROI is processed independently on its own bounding-box crop, in
+    its own worker thread (see _detect_dust_in_roi's docstring for why
+    that's the complexity fix, not just a parallelism nicety): this brings
+    the per-inspection cost down from O(full_frame_pixels) to O(sum of ROI
+    areas + total detected blob area), and the ROIs' cv2/numpy heavy
+    lifting genuinely overlaps in wall-clock time since those calls
+    release the GIL. Debug-view images are pasted back together from each
+    ROI's crop -- outside every ROI they're simply black, which matches
+    reality: nothing outside an ROI was ever analyzed, before or after
+    this change.
+
+    If the app has been calibrated (mm_per_px set via two-point calibration),
+    sizes are also reported in mm; anything under min_diameter_mm is
+    rejected too. Without calibration this step is skipped.
+
+    Returns (binary, blobs, stats, debug_images). binary is the cleaned
+    mask; blobs is a list of dust blob dicts (position, size, and a
+    ready-to-draw "label" string); stats is summary counts. debug_images
+    is None unless debug=True, in which case it's an ordered dict of
+    intermediate pipeline images (grayscale, z-score heatmap, threshold,
+    final classified result) for the pipeline-steps viewer.
+    """
+    h, w = bgr.shape[:2]
+    binary = np.zeros((h, w), dtype=np.uint8)
+    all_blobs = []
+    max_z, sum_z, count_z, dust_px, rejected = 0.0, 0.0, 0, 0, 0
+    full_gray = full_zscore = full_raw = None
+    if debug:
+        full_gray = np.zeros((h, w), dtype=np.uint8)
+        full_zscore = np.zeros((h, w), dtype=np.float32)
+        full_raw = np.zeros((h, w), dtype=np.uint8)
+
+    if rois:
+        with ThreadPoolExecutor(max_workers=min(8, len(rois))) as ex:
+            results = list(ex.map(
+                lambda roi: _detect_dust_in_roi(bgr, roi, window, z_thr, min_area, min_circularity,
+                                                 mm_per_px, min_diameter_mm, debug),
+                rois))
+
+        for blobs, local_binary, stats_partial, debug_crops, (x0, y0) in results:
+            all_blobs.extend(blobs)
+            if local_binary is not None:
+                hc, wc = local_binary.shape[:2]
+                binary[y0:y0 + hc, x0:x0 + wc] = cv2.bitwise_or(binary[y0:y0 + hc, x0:x0 + wc], local_binary)
+            if stats_partial:
+                max_z = max(max_z, stats_partial["max_z"])
+                sum_z += stats_partial["sum_z"]
+                count_z += stats_partial["count_z"]
+                dust_px += stats_partial["dust_px"]
+                rejected += stats_partial["rejected"]
+            if debug and debug_crops is not None:
+                hc, wc = debug_crops["gray"].shape[:2]
+                full_gray[y0:y0 + hc, x0:x0 + wc] = np.clip(debug_crops["gray"], 0, 255).astype(np.uint8)
+                full_zscore[y0:y0 + hc, x0:x0 + wc] = debug_crops["zscore"]
+                full_raw[y0:y0 + hc, x0:x0 + wc] = debug_crops["raw"]
+
+    stats = None
+    if count_z > 0:
+        stats = {"max_z": max_z, "mean_z": sum_z / count_z, "dust_px": dust_px,
+                 "dust_count": len(all_blobs), "rejected": rejected}
 
     debug_images = None
     if debug:
         debug_images = {}
-        debug_images["1 Grayscale"] = cv2.cvtColor(np.clip(gray, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        debug_images["1 Grayscale"] = cv2.cvtColor(full_gray, cv2.COLOR_GRAY2BGR)
         z_ceiling = max(z_thr * 3.0, 1.0)
-        z_norm = (np.clip(zscore, 0, z_ceiling) / z_ceiling * 255).astype(np.uint8)
+        z_norm = (np.clip(full_zscore, 0, z_ceiling) / z_ceiling * 255).astype(np.uint8)
         debug_images["2 Z-score heatmap"] = cv2.applyColorMap(z_norm, cv2.COLORMAP_INFERNO)
-        debug_images["3 Weak threshold (context, low bar)"] = cv2.cvtColor(weak * 255, cv2.COLOR_GRAY2BGR)
-        debug_images["4 Strong threshold (z_thr)"] = cv2.cvtColor(strong * 255, cv2.COLOR_GRAY2BGR)
-        debug_images["5 After hysteresis (before bridging)"] = cv2.cvtColor(raw, cv2.COLOR_GRAY2BGR)
-        debug_images["6 After gap-bridging"] = cv2.cvtColor(linked, cv2.COLOR_GRAY2BGR)
-        result_disp = bgr.copy()
-        for b in blobs:
-            cx, cy, r = int(b["cx"]), int(b["cy"]), int(round(b["r"]))
-            color = BLOB_COLOR_BGR.get(b["type"], (0, 0, 255))
-            cv2.circle(result_disp, (cx, cy), r + 4, color, 2)
-            cv2.putText(result_disp, b["label"], (cx + r + 10, cy + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3, cv2.LINE_AA)
-        debug_images["7 Final classified result"] = result_disp
-
-    return binary, blobs, stats, debug_images
-
-
-
-def detect_scratches(gray, roi_mask, aniso_thresh=170, min_line_length=18.0,
-                      max_line_gap=6.0, hough_threshold=16):
-    """Finds thin linear scratches via a structure-tensor anisotropy map
-    (ported from a separate lens-inspection prototype), restricted to
-    roi_mask. This is a DIFFERENT signal than the Z-score dust/thread/glue
-    classifier above: instead of asking "is this pixel brighter/darker
-    than its local neighborhood", it asks "does the local gradient point
-    consistently in one direction" -- which is what a scratch (a
-    directional groove) looks like even when its brightness contrast is
-    too faint for the Z-score to flag it as a strong blob.
-
-    gray must be a single-channel uint8/float array, same size as roi_mask
-    (roi_mask: 255 inside the union of calibrated ROI circles, 0 outside).
-
-    Returns (blobs, aniso_map) -- blobs is a list of {"type": "scratch", ...}
-    dicts; aniso_map is the raw 0-255 anisotropy map (for the pipeline
-    debug viewer), NOT masked to the ROI.
-    """
-    f = gray.astype(np.float32)
-    Ix = cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3)
-    Iy = cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3)
-    Ixx = cv2.GaussianBlur(Ix * Ix, (7, 7), 2)
-    Iyy = cv2.GaussianBlur(Iy * Iy, (7, 7), 2)
-    Ixy = cv2.GaussianBlur(Ix * Iy, (7, 7), 2)
-    tr = Ixx + Iyy
-    disc = np.sqrt(np.maximum((tr / 2) ** 2 - (Ixx * Iyy - Ixy ** 2), 0))
-    l1, l2 = tr / 2 + disc, tr / 2 - disc
-    aniso = np.where((l1 + l2) > 1e-3, (l1 - l2) / (l1 + l2 + 1e-6), 0)
-    aniso_map = cv2.normalize(aniso, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    aniso_roi = cv2.bitwise_and(aniso_map, aniso_map, mask=roi_mask)
-    _, ab = cv2.threshold(aniso_roi, aniso_thresh, 255, cv2.THRESH_BINARY)
-    lines = cv2.HoughLinesP(ab, 1, np.pi / 180, threshold=hough_threshold,
-                             minLineLength=min_line_length, maxLineGap=max_line_gap)
-
-    blobs = []
-    if lines is not None:
-        for ln in lines:
-            x1, y1, x2, y2 = ln[0]
-            length = float(np.hypot(x2 - x1, y2 - y1))
-            if length < min_line_length:
-                continue
-            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-            blobs.append({"type": "scratch", "cx": float(cx), "cy": float(cy),
-                          "r": float(max(length / 2.0, 3.0)), "length_px": length,
-                          "x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2),
-                          "label": f"scratch {length:.0f}px"})
-    return blobs, aniso_map
-
-
-def detect_pitting(gray, roi_mask, kernel_sizes=(11, 19), bin_thresh=28, min_area=4.0):
-    """Finds small bright/dark pit-like features (craters, pinholes) via
-    multi-scale morphological top-hat + black-hat (ported from the same
-    lens-inspection prototype), restricted to roi_mask.
-
-    Top-hat pulls out small BRIGHT spots against a locally darker
-    background; black-hat pulls out small DARK spots against a locally
-    brighter background -- combining both catches pits regardless of
-    whether they read bright or dark under the current lighting. Two
-    kernel sizes are summed so both small and slightly larger pits show
-    up in one pass, without needing two separate detection runs.
-
-    Returns (blobs, pit_map) -- blobs is a list of {"type": "pit", ...}
-    dicts; pit_map is the raw 0-255 combined top-hat/black-hat map (for
-    the pipeline debug viewer), NOT masked to the ROI.
-    """
-    combo = np.zeros(gray.shape, np.float32)
-    for ks in kernel_sizes:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(ks), int(ks)))
-        combo += cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, k).astype(np.float32)
-        combo += cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, k).astype(np.float32)
-    pit_map = cv2.normalize(combo, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    pit_roi = cv2.bitwise_and(pit_map, pit_map, mask=roi_mask)
-    _, pb = cv2.threshold(pit_roi, bin_thresh, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(pb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    blobs = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        if area < min_area:
-            continue
-        (cx, cy), r = cv2.minEnclosingCircle(c)
-        blobs.append({"type": "pit", "cx": float(cx), "cy": float(cy),
-                      "r": float(max(r, 3.0)), "area_px": float(area),
-                      "label": f"pit {area:.0f}px2"})
-    return blobs, pit_map
-
-
-def run_full_detection(bgr, rois, settings, debug=False):
-    """Combines this app's original Z-score dust/thread/glue classifier
-    with two additional detectors ported from a separate lens-inspection
-    prototype: scratch detection (structure-tensor anisotropy + Hough
-    lines) and pitting detection (multi-scale top-hat/black-hat). All
-    three run inside the SAME calibrated ROI masks set up in Teaching --
-    the prototype's own round-lens ROI auto-detection (Hough circles for
-    a concentric lens barrel) was deliberately NOT ported, since these
-    are flat camera modules with manually placed/calibrated ROIs, not a
-    circular lens dome.
-
-    Returns (blobs, stats, debug_images) -- blobs is the merged list
-    across all three detectors (same dict shape as run_zscore_detection's
-    blobs, each with "type"/"cx"/"cy"/"r"/"label"); stats augments the
-    Z-score stats dict with scratch_count/pit_count/total_count; and
-    debug_images (only when debug=True) extends the Z-score pipeline
-    debug dict with the anisotropy map, pitting map, and a final combined
-    result image drawing all defect types together.
-    """
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-
-    _binary, blobs, stats, dbg = run_zscore_detection(
-        bgr, rois, settings["window"], settings["z_thr"], settings["min_area"],
-        settings["min_circularity"], settings.get("scale_mm_per_px"), settings["min_diameter_mm"],
-        settings["min_aspect_ratio"], settings["max_thin_width_px"], settings["max_arc_fit_residual"],
-        settings["gap_bridge_px"], settings["z_thr_low"], debug=debug)
-
-    roi_mask = np.zeros(gray.shape, dtype=np.uint8)
-    for roi in rois:
-        cv2.circle(roi_mask, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), 255, -1)
-
-    scratch_blobs, aniso_map = [], None
-    if settings.get("scratch_enabled", True):
-        scratch_blobs, aniso_map = detect_scratches(
-            gray, roi_mask,
-            aniso_thresh=settings.get("scratch_aniso_thresh", 170),
-            min_line_length=settings.get("scratch_min_length_px", 18.0),
-            max_line_gap=settings.get("scratch_max_gap_px", 6.0),
-            hough_threshold=settings.get("scratch_hough_thresh", 16))
-
-    pit_blobs, pit_map = [], None
-    if settings.get("pit_enabled", True):
-        pit_blobs, pit_map = detect_pitting(
-            gray, roi_mask,
-            kernel_sizes=(settings.get("pit_kernel_small", 11), settings.get("pit_kernel_large", 19)),
-            bin_thresh=settings.get("pit_bin_thresh", 28),
-            min_area=settings.get("pit_min_area_px", 4.0))
-
-    all_blobs = blobs + scratch_blobs + pit_blobs
-
-    if stats is not None:
-        stats["scratch_count"] = len(scratch_blobs)
-        stats["pit_count"] = len(pit_blobs)
-        stats["total_count"] = len(all_blobs)
-
-    debug_images = None
-    if debug:
-        debug_images = dbg if dbg is not None else {}
-        if aniso_map is not None:
-            debug_images["8 Scratch anisotropy map"] = cv2.applyColorMap(aniso_map, cv2.COLORMAP_PLASMA)
-        if pit_map is not None:
-            debug_images["9 Pitting top-hat/black-hat map"] = cv2.applyColorMap(pit_map, cv2.COLORMAP_INFERNO)
+        debug_images["3 Threshold (z_thr)"] = cv2.cvtColor(full_raw, cv2.COLOR_GRAY2BGR)
         result_disp = bgr.copy()
         for b in all_blobs:
             cx, cy, r = int(b["cx"]), int(b["cy"]), int(round(b["r"]))
             color = BLOB_COLOR_BGR.get(b["type"], (0, 0, 255))
             cv2.circle(result_disp, (cx, cy), r + 4, color, 2)
             cv2.putText(result_disp, b["label"], (cx + r + 10, cy + 8), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3, cv2.LINE_AA)
-        debug_images["10 Final combined result (all defect types)"] = result_disp
+        debug_images["4 Final classified result"] = result_disp
 
-    return all_blobs, stats, debug_images
+    return binary, all_blobs, stats, debug_images
 
 
 
@@ -869,6 +758,164 @@ class ZoomableImageCanvas:
         self.canvas.create_image(vx + l * s, vy + t * s, anchor="nw", image=self.photo)
 
 
+# ==================================================== AI ANOMALY DETECTION ==
+class AIModelManager:
+    """Owns loading and running the trained anomaly-detection models that
+    Training Studio produces -- one ONNX model per (model_name, cam_label)
+    pair, exactly matching how Training Studio now scopes a training run
+    to one phone-model profile AND one camera position together. Nothing
+    here touches Tkinter; the app just calls load()/score().
+
+    Deliberately uses ONNX Runtime, not anomalib/torch: Training Studio's
+    own docstring already says training happens on a different, more
+    capable machine than the operator's PC, so the trained model has to
+    be exported (Training Studio already does this to ONNX) and the
+    resulting .onnx file copied over -- this class is what loads that
+    file and runs it here, without needing the ~2GB torch/anomalib stack
+    installed on the line PC.
+
+    IMPORTANT CAVEAT (untested against a real anomalib export): anomalib's
+    exact ONNX output contract -- whether the graph outputs a single
+    already-normalized image-level score, a raw score plus a per-pixel
+    anomaly map, or something else -- has shifted across anomalib
+    versions and isn't something this environment could verify (no
+    anomalib/torch install here, so no real .onnx file to test against).
+    This class handles it generically (see score()'s docstring) and reads
+    a sibling metadata.json for the threshold the way anomalib usually
+    exports one, but the actual scores this produces should be sanity
+    checked against Test Detection on a real trained model before trusting
+    it on the line -- if the output shape doesn't match what's assumed
+    here, tell me the exact shapes/error and this gets fixed against your
+    actual anomalib version.
+    """
+
+    def __init__(self):
+        self._sessions = {}    # key -> onnxruntime.InferenceSession
+        self._input_meta = {}  # key -> (input_name, (height, width))
+        self._thresholds = {}  # key -> float image-level anomaly threshold
+        self._paths = {}       # key -> onnx path actually loaded
+        self._errors = {}      # key -> last load/inference error string
+
+    @staticmethod
+    def _key(model_name, cam_label):
+        return f"{(model_name or '').strip()}::{(cam_label or '').strip()}"
+
+    def is_loaded(self, model_name, cam_label):
+        return self._key(model_name, cam_label) in self._sessions
+
+    def loaded_path(self, model_name, cam_label):
+        return self._paths.get(self._key(model_name, cam_label))
+
+    def last_error(self, model_name, cam_label):
+        return self._errors.get(self._key(model_name, cam_label))
+
+    def threshold(self, model_name, cam_label):
+        return self._thresholds.get(self._key(model_name, cam_label), 0.5)
+
+    def set_threshold(self, model_name, cam_label, value):
+        self._thresholds[self._key(model_name, cam_label)] = float(value)
+
+    def load(self, model_name, cam_label, onnx_path, manual_threshold=None):
+        """(Re)loads the ONNX model for this camera position. Returns
+        (True, None) on success or (False, error_message) on failure --
+        never raises, so a bad/missing file just shows as a status
+        message in the UI rather than crashing the app."""
+        key = self._key(model_name, cam_label)
+        if not ONNXRUNTIME_AVAILABLE:
+            self._errors[key] = "onnxruntime is not installed in this environment"
+            return False, self._errors[key]
+        try:
+            session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+            inp = session.get_inputs()[0]
+            shape = inp.shape  # e.g. [1, 3, 256, 256] -- dynamic dims may come back as strings
+            h = shape[2] if isinstance(shape[2], int) else 256
+            w = shape[3] if isinstance(shape[3], int) else 256
+            self._sessions[key] = session
+            self._input_meta[key] = (inp.name, (h, w))
+            self._paths[key] = onnx_path
+
+            threshold = manual_threshold
+            if threshold is None:
+                # anomalib commonly exports a metadata.json next to the
+                # ONNX file carrying the image-level anomaly threshold --
+                # best-effort read, since this isn't guaranteed present or
+                # named the same across every anomalib version.
+                meta_path = os.path.join(os.path.dirname(onnx_path), "metadata.json")
+                if os.path.exists(meta_path):
+                    try:
+                        with open(meta_path, "r") as f:
+                            meta = json.load(f)
+                        threshold = meta.get("image_threshold", meta.get("threshold"))
+                    except Exception:
+                        threshold = None
+            self._thresholds[key] = float(threshold) if threshold is not None else 0.5
+            self._errors.pop(key, None)
+            return True, None
+        except Exception as e:
+            self._errors[key] = str(e)
+            self._sessions.pop(key, None)
+            self._input_meta.pop(key, None)
+            self._paths.pop(key, None)
+            return False, str(e)
+
+    def unload(self, model_name, cam_label):
+        key = self._key(model_name, cam_label)
+        self._sessions.pop(key, None)
+        self._input_meta.pop(key, None)
+        self._paths.pop(key, None)
+        self._errors.pop(key, None)
+
+    def score(self, model_name, cam_label, crop_bgr):
+        """Runs one ROI's circular crop (same clean, black-filled-corner
+        crop the operator app saves for training -- consistent input is
+        what makes this a fair comparison against training data) through
+        that camera's loaded model.
+
+        Preprocessing follows anomalib's typical default: resize to the
+        model's own expected input size (read from the ONNX graph, not
+        hardcoded), RGB, ImageNet mean/std normalization, NCHW float32 --
+        the standard anomalib preprocessing, though not guaranteed for
+        every export config.
+
+        Output handling: prefers a scalar (size-1) output as the
+        image-level anomaly score; if every output is a multi-element
+        map, falls back to that map's max value (a per-pixel anomaly map
+        collapsed to "how anomalous is the worst pixel", a reasonable
+        stand-in for an image-level score when no scalar output exists).
+
+        Returns (anomaly_score, is_anomalous: bool), or None if no model
+        is loaded for this (model_name, cam_label)."""
+        key = self._key(model_name, cam_label)
+        session = self._sessions.get(key)
+        if session is None:
+            return None
+        input_name, (h, w) = self._input_meta[key]
+        try:
+            img = cv2.resize(crop_bgr, (w, h), interpolation=cv2.INTER_AREA)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+            std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+            img = (img - mean) / std
+            tensor = np.transpose(img, (2, 0, 1))[None, ...].astype(np.float32)
+            outputs = session.run(None, {input_name: tensor})
+
+            score_val = None
+            for out in outputs:
+                arr = np.asarray(out)
+                if arr.size == 1:
+                    score_val = float(arr.reshape(-1)[0])
+                    break
+            if score_val is None:
+                arr = max((np.asarray(o) for o in outputs), key=lambda a: a.size)
+                score_val = float(arr.max())
+
+            self._errors.pop(key, None)
+            return score_val, score_val >= self._thresholds.get(key, 0.5)
+        except Exception as e:
+            self._errors[key] = str(e)
+            return None
+
+
 # =============================================================== MAIN APP ==
 class DustInspectorApp:
     def __init__(self, root):
@@ -897,13 +944,16 @@ class DustInspectorApp:
         self.f_op_stat_num = ctk.CTkFont(size=38, weight="bold")
 
         self.settings = load_settings()
+        if self.settings.get("storage_base_path"):
+            _apply_storage_base(self.settings["storage_base_path"])
         self.cam = CameraManager()
+        self.ai_models = AIModelManager()
 
         # shared state
         self.original = None
         self.using_static_image = False
         self.rois = []                 # active ROI set used by the main window
-        self.last_blobs = []           # last inspection's accepted blobs: dust/thread/glue
+        self.last_blobs = []           # last inspection's accepted dust blobs
         self.inspection_running = False
 
         # teaching-window-only interactive state (ROI editor canvas)
@@ -937,6 +987,18 @@ class DustInspectorApp:
         self._pipeline_images = {}
         self.pipeline_canvases = []
 
+        # ---- Collector-mode state (uses the SAME self.cam / self.rois /
+        # self.settings["model_name"] as the rest of the app -- no separate
+        # camera connection or ROI layout, by design, so a capture here is
+        # guaranteed to match production's exact crop shape/position) ----
+        self.collector_frozen_frame = None
+        self.collector_photo = None
+        self.collector_display_scale = 1.0
+        self.collector_last_saved_per_cam = {}
+        self.collector_history = []
+        self.collector_burst_running = False
+        self.collector_burst_job = None
+
         self.model_line_var = tk.StringVar(value=self._model_line_text())
         self.status_var = tk.StringVar(value="IDLE")
         self.barcode_var = tk.StringVar(value="")
@@ -953,8 +1015,29 @@ class DustInspectorApp:
 
         self._build_main_ui()
         self._load_active_roi_layout()
+        self._load_configured_ai_models()
         self._auto_connect_camera()
         self._poll_live()
+
+    def _load_configured_ai_models(self):
+        """Loads every (model_name, cam_label) -> .onnx mapping already
+        saved in settings, so a technician's earlier AI-model setup is
+        ready on next launch without re-browsing for the file. Best-effort
+        per entry -- a missing/bad file just leaves that camera's model
+        unloaded (shown as an error in the AI Model tab) rather than
+        blocking startup."""
+        model = self.settings.get("model_name")
+        paths = self.settings.get("ai_model_paths", {}) or {}
+        thresholds = self.settings.get("ai_thresholds", {}) or {}
+        for key, onnx_path in paths.items():
+            if "::" not in key:
+                continue
+            key_model, cam_label = key.split("::", 1)
+            if model and key_model != model:
+                continue  # only auto-load the currently active model's cameras
+            if not onnx_path or not os.path.exists(onnx_path):
+                continue
+            self.ai_models.load(key_model, cam_label, onnx_path, thresholds.get(key))
 
     # ------------------------------------------------------------- utils --
     def _model_line_text(self):
@@ -1013,6 +1096,9 @@ class DustInspectorApp:
         self.nav_teaching_btn = ctk.CTkButton(nav, text="Teaching", width=110, corner_radius=8, font=self.f_body,
                                                command=self.show_teaching_page)
         self.nav_teaching_btn.pack(side="left", padx=4, pady=4)
+        self.nav_collector_btn = ctk.CTkButton(nav, text="Collector", width=110, corner_radius=8, font=self.f_body,
+                                                command=self.show_collector_page)
+        self.nav_collector_btn.pack(side="left", padx=4, pady=4)
 
         # ---- swappable content area: same window, no separate popup ----
         container = ctk.CTkFrame(outer, fg_color=BG, corner_radius=0)
@@ -1023,13 +1109,16 @@ class DustInspectorApp:
         self.page_operator = ctk.CTkFrame(container, fg_color=BG, corner_radius=0)
         self.page_teaching = ctk.CTkFrame(container, fg_color=BG, corner_radius=0)
         self.page_pipeline = ctk.CTkFrame(container, fg_color=BG, corner_radius=0)
+        self.page_collector = ctk.CTkFrame(container, fg_color=BG, corner_radius=0)
         self.page_operator.grid(row=0, column=0, sticky="nsew")
         self.page_teaching.grid(row=0, column=0, sticky="nsew")
         self.page_pipeline.grid(row=0, column=0, sticky="nsew")
+        self.page_collector.grid(row=0, column=0, sticky="nsew")
 
         self._build_operator_page(self.page_operator)
         self._build_teaching_page(self.page_teaching)
         self._build_pipeline_page(self.page_pipeline)
+        self._build_collector_page(self.page_collector)
 
         # ---- footer ----
         footer = ctk.CTkFrame(outer, fg_color=BG_SIDEBAR, height=30, corner_radius=0)
@@ -1039,25 +1128,39 @@ class DustInspectorApp:
 
         self.show_operator_page()
 
+    def _reset_nav_button_colors(self):
+        for btn in (self.nav_operator_btn, self.nav_teaching_btn, self.nav_collector_btn):
+            btn.configure(fg_color="transparent", hover_color=BORDER, text_color=TEXT_MUTED)
+
     def show_operator_page(self):
         self.current_view = "operator"
         self.page_operator.tkraise()
+        self._reset_nav_button_colors()
         self.nav_operator_btn.configure(fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#ffffff")
-        self.nav_teaching_btn.configure(fg_color="transparent", hover_color=BORDER, text_color=TEXT_MUTED)
         self._render_main_feed()
         self.barcode_entry.focus_set()
 
     def show_teaching_page(self):
         self.current_view = "teaching"
         self.page_teaching.tkraise()
+        self._reset_nav_button_colors()
         self.nav_teaching_btn.configure(fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#ffffff")
-        self.nav_operator_btn.configure(fg_color="transparent", hover_color=BORDER, text_color=TEXT_MUTED)
         self.fit_roi_view()
+        self._refresh_ai_tab()  # camera list / load status may have changed since the tab was built
         self._render_roi_canvas()
 
     def show_pipeline_page(self):
         self.current_view = "pipeline"
         self.page_pipeline.tkraise()
+
+    def show_collector_page(self):
+        self.current_view = "collector"
+        self.page_collector.tkraise()
+        self._reset_nav_button_colors()
+        self.nav_collector_btn.configure(fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color="#ffffff")
+        self.collector_model_var.set(self._model_line_text())
+        self._collector_update_counts_display()
+        self._render_collector_feed()
 
     def _build_pipeline_page(self, page):
         top = ctk.CTkFrame(page, fg_color="transparent")
@@ -1097,6 +1200,331 @@ class DustInspectorApp:
             zc.canvas.pack(padx=14, pady=(0, 14))
             zc.set_image(img)
             self.pipeline_canvases.append(zc)
+
+    # ================================================== COLLECTOR MODE UI
+    # Training-data capture, folded into the main app instead of a separate
+    # tool. Deliberately reuses self.cam (already connected/live) and
+    # self.rois (whatever layout Teaching currently has active) rather than
+    # having its own camera connection or ROI editor -- that's the whole
+    # point of merging: one camera lock, one ROI layout, so a capture here
+    # is guaranteed to be the exact same crop shape/position production
+    # inspection uses. Training Studio (separate training tool) is
+    # deliberately NOT part of this merge.
+    def _build_collector_page(self, page):
+        top = ctk.CTkFrame(page, fg_color="transparent")
+        top.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(top, text="Collector Mode", font=self.f_title, text_color=TEXT).pack(side="left")
+        self.collector_model_var = tk.StringVar(value=self._model_line_text())
+        ctk.CTkLabel(top, textvariable=self.collector_model_var, font=self.f_small,
+                     text_color=TEXT_MUTED).pack(side="left", padx=(14, 0))
+        ctk.CTkLabel(page, text="Captures use the SAME ROI layout as Teaching -- set that up there first "
+                                 "if you haven't already. Space = Capture, G = Good, D = Defect.",
+                     font=self.f_small, text_color=TEXT_MUTED, wraplength=900, justify="left").pack(
+            anchor="w", pady=(0, 8))
+
+        body = ctk.CTkFrame(page, fg_color="transparent")
+        body.pack(fill="both", expand=True)
+        body.grid_columnconfigure(0, weight=3)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
+
+        # ---- left: feed ----
+        feed_card = self._card(body)
+        feed_card.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        ctk.CTkLabel(feed_card, text="Live Feed (with active ROIs)", font=self.f_small,
+                     text_color=TEXT_MUTED).pack(anchor="w", padx=14, pady=(12, 0))
+        wrap = ctk.CTkFrame(feed_card, fg_color=BG_CANVAS, corner_radius=10)
+        wrap.pack(fill="both", expand=True, padx=14, pady=14)
+        self.collector_canvas = tk.Canvas(wrap, bg=BG_CANVAS, highlightthickness=0)
+        self.collector_canvas.pack(fill="both", expand=True)
+
+        # ---- right: controls ----
+        right = ctk.CTkScrollableFrame(body, fg_color=BG_CARD, corner_radius=14)
+        right.grid(row=0, column=1, sticky="nsew")
+
+        save_card = self._card(right)
+        save_card.pack(fill="x", padx=10, pady=(10, 10))
+        ctk.CTkLabel(save_card, text="Save location", font=self.f_small, text_color=TEXT_MUTED).pack(
+            anchor="w", padx=10, pady=(10, 0))
+        self.collector_save_root_var = tk.StringVar(value=self.settings.get("collector_save_root") or "(not set)")
+        ctk.CTkLabel(save_card, textvariable=self.collector_save_root_var, font=self.f_small, text_color=TEXT,
+                     wraplength=240, justify="left").pack(anchor="w", padx=10, pady=(2, 6))
+        self._btn_secondary(save_card, "Choose Folder...", self._collector_choose_save_root, width=160).pack(
+            anchor="w", padx=10, pady=(0, 10))
+
+        cap_card = self._card(right)
+        cap_card.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkLabel(cap_card, text="Capture", font=self.f_small, text_color=TEXT_MUTED).pack(
+            anchor="w", padx=10, pady=(10, 4))
+        self._btn_primary(cap_card, "Capture Frame (Space)", self._collector_capture_frame, width=220).pack(
+            padx=10, pady=(0, 8), fill="x")
+        btn_row = ctk.CTkFrame(cap_card, fg_color="transparent")
+        btn_row.pack(fill="x", padx=10, pady=(0, 6))
+        ctk.CTkButton(btn_row, text="GOOD (G)", font=self.f_body, fg_color=SUCCESS, hover_color=SUCCESS_HOVER,
+                      command=lambda: self._collector_label_capture("good"), height=44).pack(
+            side="left", fill="x", expand=True, padx=(0, 4))
+        ctk.CTkButton(btn_row, text="DEFECT (D)", font=self.f_body, fg_color=DANGER, hover_color=DANGER_HOVER,
+                      command=lambda: self._collector_label_capture("defect"), height=44).pack(
+            side="left", fill="x", expand=True, padx=(4, 0))
+        sev_row = ctk.CTkFrame(cap_card, fg_color="transparent")
+        sev_row.pack(fill="x", padx=10, pady=(6, 10))
+        ctk.CTkLabel(sev_row, text="Defect severity:", font=self.f_small, text_color=TEXT_MUTED).pack(side="left")
+        self.collector_severity_var = tk.StringVar(value="unspecified")
+        ctk.CTkOptionMenu(sev_row, values=["unspecified", "mild", "medium", "severe"],
+                          variable=self.collector_severity_var, width=120, font=self.f_small,
+                          fg_color=BG_CARD_ALT, button_color=BORDER, button_hover_color=BORDER).pack(
+            side="left", padx=(6, 0))
+        self._btn_secondary(cap_card, "Resume Live Feed", self._collector_resume_live, width=220).pack(
+            padx=10, pady=(0, 10), fill="x")
+
+        opt_card = self._card(right)
+        opt_card.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkLabel(opt_card, text="Options", font=self.f_small, text_color=TEXT_MUTED).pack(
+            anchor="w", padx=10, pady=(10, 4))
+        self.collector_dup_var = tk.BooleanVar(value=self.settings.get("collector_duplicate_check", True))
+        ctk.CTkSwitch(opt_card, text="Skip near-duplicate frames", variable=self.collector_dup_var,
+                      font=self.f_small, command=self._collector_save_options).pack(anchor="w", padx=10, pady=(0, 6))
+        burst_row = ctk.CTkFrame(opt_card, fg_color="transparent")
+        burst_row.pack(fill="x", padx=10, pady=(0, 10))
+        self.collector_burst_btn = ctk.CTkButton(burst_row, text="Start Auto-collect Good", font=self.f_small,
+                                                  fg_color=BG_CARD_ALT, hover_color=BORDER,
+                                                  command=self._collector_toggle_burst_mode)
+        self.collector_burst_btn.pack(side="left", fill="x", expand=True)
+        self.collector_burst_interval_var = tk.StringVar(value="5")
+        ctk.CTkEntry(burst_row, textvariable=self.collector_burst_interval_var, width=40,
+                     font=self.f_small).pack(side="left", padx=(6, 0))
+        ctk.CTkLabel(burst_row, text="sec", font=self.f_small, text_color=TEXT_MUTED).pack(side="left", padx=(4, 0))
+
+        counts_card = self._card(right)
+        counts_card.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkLabel(counts_card, text="Collected (this model)", font=self.f_small, text_color=TEXT_MUTED).pack(
+            anchor="w", padx=10, pady=(10, 4))
+        self.collector_counts_label = ctk.CTkLabel(counts_card, text="No captures yet.", font=self.f_small,
+                                                     text_color=TEXT, justify="left", wraplength=240)
+        self.collector_counts_label.pack(anchor="w", padx=10, pady=(0, 10))
+
+        hist_card = self._card(right)
+        hist_card.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkLabel(hist_card, text="Recent captures (Undo deletes files)", font=self.f_small,
+                     text_color=TEXT_MUTED).pack(anchor="w", padx=10, pady=(10, 4))
+        self.collector_history_frame = ctk.CTkFrame(hist_card, fg_color="transparent")
+        self.collector_history_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        self.root.bind("<space>", self._collector_on_space)
+        self.root.bind("g", self._collector_on_g)
+        self.root.bind("G", self._collector_on_g)
+        self.root.bind("d", self._collector_on_d)
+        self.root.bind("D", self._collector_on_d)
+
+    # -- guarded keyboard shortcuts: only act while Collector page is showing,
+    # so typing in the barcode box (Operator) or any Teaching field never
+    # accidentally triggers a capture/label ----
+    def _collector_on_space(self, event):
+        if self.current_view == "collector":
+            self._collector_capture_frame()
+
+    def _collector_on_g(self, event):
+        if self.current_view == "collector":
+            self._collector_label_capture("good")
+
+    def _collector_on_d(self, event):
+        if self.current_view == "collector":
+            self._collector_label_capture("defect")
+
+    def _render_collector_feed(self):
+        frame = self.collector_frozen_frame if self.collector_frozen_frame is not None else self.original
+        self.collector_canvas.delete("all")
+        if frame is None:
+            return
+        canvas_w = max(self.collector_canvas.winfo_width(), 100)
+        canvas_h = max(self.collector_canvas.winfo_height(), 100)
+        h, w = frame.shape[:2]
+        scale = min(canvas_w / w, canvas_h / h)
+        self.collector_display_scale = scale
+        disp = cv2.resize(frame, (max(int(w * scale), 1), max(int(h * scale), 1)))
+        for roi in self.rois:
+            cx, cy, r = int(roi["cx"] * scale), int(roi["cy"] * scale), int(roi["r"] * scale)
+            cv2.circle(disp, (cx, cy), r, (0, 255, 0), 2)
+            cv2.putText(disp, roi.get("cam_label", "?"), (cx - r, max(cy - r - 6, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb)
+        self.collector_photo = ImageTk.PhotoImage(img)
+        self.collector_canvas.create_image(0, 0, image=self.collector_photo, anchor="nw")
+
+    def _collector_choose_save_root(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.settings["collector_save_root"] = folder
+            self.collector_save_root_var.set(folder)
+            save_settings(self.settings)
+
+    def _collector_save_options(self):
+        self.settings["collector_duplicate_check"] = bool(self.collector_dup_var.get())
+        save_settings(self.settings)
+
+    def _collector_capture_frame(self):
+        if self.original is None:
+            messagebox.showinfo("Collector", "No live frame available yet.")
+            return
+        self.collector_frozen_frame = self.original.copy()
+        self._render_collector_feed()
+
+    def _collector_resume_live(self):
+        self.collector_frozen_frame = None
+
+    def _collector_is_duplicate(self, cam_label, crop):
+        if not self.collector_dup_var.get():
+            return False
+        prev = self.collector_last_saved_per_cam.get(cam_label)
+        if prev is None or prev.shape != crop.shape:
+            return False
+        diff = float(np.mean(np.abs(prev.astype("float32") - crop.astype("float32"))))
+        return diff < float(self.settings.get("collector_duplicate_threshold", 2.0))
+
+    def _collector_label_capture(self, label):
+        if not self.settings.get("collector_save_root"):
+            messagebox.showinfo("Collector", "Choose a save location first.")
+            return
+        model = self.settings.get("model_name") or ""
+        if not model.strip():
+            messagebox.showinfo("Collector", "Set a Model name in Teaching first.")
+            return
+        if not self.rois:
+            messagebox.showinfo("Collector", "No ROIs defined yet -- set them up in Teaching first.")
+            return
+        frame = self.collector_frozen_frame if self.collector_frozen_frame is not None else self.original
+        if frame is None:
+            messagebox.showinfo("Collector", "No frame available to save.")
+            return
+
+        _ensure_cam_labels(self.rois)
+        model_folder = _safe_folder_name(model)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        severity = self.collector_severity_var.get() if label == "defect" else None
+        saved_paths, skipped = [], []
+
+        for roi in self.rois:
+            cam_label = roi.get("cam_label", "cam?")
+            crop = crop_circular(frame, roi)
+            if crop is None:
+                continue
+            if self._collector_is_duplicate(cam_label, crop):
+                skipped.append(cam_label)
+                continue
+            class_dir = os.path.join(self.settings["collector_save_root"], model_folder, cam_label, label)
+            os.makedirs(class_dir, exist_ok=True)
+            sev_suffix = f"_{severity}" if severity and severity != "unspecified" else ""
+            fpath = os.path.join(class_dir, f"{cam_label}_{ts}{sev_suffix}.png")
+            cv2.imwrite(fpath, crop)
+            saved_paths.append(fpath)
+            self.collector_last_saved_per_cam[cam_label] = crop
+            key = f"{model}||{cam_label}||{label}"
+            counts = self.settings.setdefault("collector_counts", {})
+            counts[key] = counts.get(key, 0) + 1
+
+        save_settings(self.settings)
+
+        if not saved_paths and skipped:
+            self.footer_var.set(f"Collector: skipped (looked like a duplicate): {', '.join(skipped)}")
+            return
+        if not saved_paths:
+            messagebox.showinfo("Collector", "Nothing was saved (ROIs fell outside the frame?).")
+            return
+
+        self._collector_update_counts_display()
+        self._collector_add_history_entry(saved_paths, label, frame)
+        note = f"Collector: saved {len(saved_paths)} crop(s) as {label.upper()}"
+        if skipped:
+            note += f" (skipped duplicate: {', '.join(skipped)})"
+        self.footer_var.set(note)
+        self.collector_frozen_frame = None  # back to live so the next click grabs a fresh frame
+
+    def _collector_update_counts_display(self):
+        model = self.settings.get("model_name") or ""
+        counts = self.settings.get("collector_counts", {})
+        by_cam = {}
+        for key, n in counts.items():
+            try:
+                m, cam, cls = key.split("||", 2)
+            except ValueError:
+                continue
+            if m != model:
+                continue
+            by_cam.setdefault(cam, {"good": 0, "defect": 0})
+            by_cam[cam][cls] = by_cam[cam].get(cls, 0) + n
+        if not by_cam:
+            self.collector_counts_label.configure(text="No captures yet for this model.")
+            return
+        lines = [f"{cam}: {c.get('good', 0)} good, {c.get('defect', 0)} defect" for cam, c in sorted(by_cam.items())]
+        self.collector_counts_label.configure(text="\n".join(lines))
+
+    def _collector_add_history_entry(self, paths, label, frame):
+        try:
+            thumb_src = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            thumb_src.thumbnail((70, 70))
+            photo = ImageTk.PhotoImage(thumb_src)
+        except Exception:
+            photo = None
+        entry = {"paths": paths, "label": label, "photo": photo}
+        self.collector_history.insert(0, entry)
+        self.collector_history = self.collector_history[:8]
+        self._collector_render_history()
+
+    def _collector_render_history(self):
+        for w in self.collector_history_frame.winfo_children():
+            w.destroy()
+        for entry in self.collector_history:
+            row = ctk.CTkFrame(self.collector_history_frame, fg_color=BG_CARD_ALT, corner_radius=8)
+            row.pack(fill="x", pady=3)
+            if entry.get("photo") is not None:
+                tk.Label(row, image=entry["photo"], bg=BG_CARD_ALT, bd=0).pack(side="left", padx=6, pady=6)
+            color = SUCCESS if entry["label"] == "good" else DANGER
+            ctk.CTkLabel(row, text=f"{entry['label'].upper()} ({len(entry['paths'])} files)",
+                         font=self.f_small, text_color=color).pack(side="left", padx=6)
+            ctk.CTkButton(row, text="Undo", width=56, font=self.f_small, fg_color=BG_CARD,
+                          hover_color=BORDER, text_color=DANGER,
+                          command=lambda e=entry: self._collector_undo_entry(e)).pack(side="right", padx=6)
+
+    def _collector_undo_entry(self, entry):
+        model = self.settings.get("model_name") or ""
+        for p in entry["paths"]:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+            cam_label = os.path.basename(os.path.dirname(os.path.dirname(p)))
+            key = f"{model}||{cam_label}||{entry['label']}"
+            counts = self.settings.setdefault("collector_counts", {})
+            if counts.get(key, 0) > 0:
+                counts[key] -= 1
+        save_settings(self.settings)
+        self.collector_history.remove(entry)
+        self._collector_update_counts_display()
+        self._collector_render_history()
+
+    def _collector_toggle_burst_mode(self):
+        self.collector_burst_running = not self.collector_burst_running
+        if self.collector_burst_running:
+            self.collector_burst_btn.configure(text="Stop Auto-collect Good", fg_color=WARNING)
+            self._collector_burst_tick()
+        else:
+            self.collector_burst_btn.configure(text="Start Auto-collect Good", fg_color=BG_CARD_ALT)
+            if self.collector_burst_job is not None:
+                self.root.after_cancel(self.collector_burst_job)
+                self.collector_burst_job = None
+
+    def _collector_burst_tick(self):
+        if not self.collector_burst_running:
+            return
+        if self.original is not None:
+            self.collector_frozen_frame = self.original.copy()
+            self._collector_label_capture("good")
+        try:
+            interval = max(float(self.collector_burst_interval_var.get()), 1.0)
+        except ValueError:
+            interval = 5.0
+        self.collector_burst_job = self.root.after(int(interval * 1000), self._collector_burst_tick)
 
     def _build_operator_page(self, page):
         # ---- big, centered header -- this is what the operator sees first ----
@@ -1205,11 +1633,13 @@ class DustInspectorApp:
         tab_model = tabs.add("Model & Line")
         tab_roi = tabs.add("ROI & Calibration")
         tab_detect = tabs.add("Detection")
+        tab_ai = tabs.add("AI Model")
         tab_cam = tabs.add("Camera")
 
         self._build_model_tab(tab_model)
         self._build_roi_tab(tab_roi)
         self._build_detection_tab(tab_detect)
+        self._build_ai_tab(tab_ai)
         self._build_camera_tab(tab_cam)
 
     def _set_status(self, text, color):
@@ -1245,6 +1675,8 @@ class DustInspectorApp:
                 self._render_main_feed()
                 if self.current_view == "teaching":
                     self._render_roi_canvas()
+                elif self.current_view == "collector" and self.collector_frozen_frame is None:
+                    self._render_collector_feed()
         self.root.after(120, self._poll_live)
 
     # -------------------------------------------------------- ROI layouts --
@@ -1257,10 +1689,12 @@ class DustInspectorApp:
             try:
                 with open(path, "r") as f:
                     self.rois = json.load(f)
+                _ensure_cam_labels(self.rois)  # migrates older layouts saved before camera labeling existed
             except Exception:
                 self.rois = []
 
     def _activate_roi_layout(self, name, rois):
+        _ensure_cam_labels(rois)  # migrates older layouts saved before camera labeling existed
         self.rois = rois
         self.settings["active_roi_name"] = name
         save_settings(self.settings)
@@ -1426,7 +1860,9 @@ class DustInspectorApp:
         """
         s = self.settings
         try:
-            blobs, _stats, _dbg = run_full_detection(frame, rois_snapshot, s, debug=False)
+            _binary, blobs, _stats, _dbg = run_zscore_detection(
+                frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
+                s.get("scale_mm_per_px"), s["min_diameter_mm"])
         except Exception:
             blobs = []
 
@@ -1439,14 +1875,78 @@ class DustInspectorApp:
         background thread, no Tkinter here. Returns (verdict, log_args) --
         log_args gets handed to _append_log_line on the main thread since
         that call touches a Tkinter widget."""
-        verdict = "FAIL" if blobs else "PASS"
+        blobs = list(blobs)  # local copy -- AI-anomaly findings get appended below
+
+        model, line = self.settings.get("model_name"), self.settings.get("line_name")
+        model_folder = _safe_folder_name(model)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Full frame, ROI circles only (green) -- kept for traceability,
+        # filed under the model's own folder so different phone models
+        # (different camera counts/positions) never land in the same place.
+        source_model_dir = os.path.join(SOURCE_DIR, model_folder)
+        os.makedirs(source_model_dir, exist_ok=True)
         source_disp = frame.copy()
         for roi in rois_snapshot:
             cv2.circle(source_disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), (0, 255, 0), 2)
-        cv2.imwrite(os.path.join(SOURCE_DIR, f"source_{ts}_{barcode}.png"), source_disp)
+        cv2.imwrite(os.path.join(source_model_dir, f"source_{ts}_{barcode}.png"), source_disp)
 
+        # Per-ROI clean crops (no circles/markup burned in) -- one per
+        # camera position, filed under <Model>/<camN>/. This is the data
+        # anomaly-detection training will actually use later: each camera
+        # position's own folder, never mixed with another camera's, and
+        # never mixed with a different phone model's images.
+        _ensure_cam_labels(rois_snapshot)
+        h, w = frame.shape[:2]
+        for roi in rois_snapshot:
+            cx, cy, r = int(roi["cx"]), int(roi["cy"]), int(roi["r"])
+            x0, y0 = max(0, cx - r), max(0, cy - r)
+            x1, y1 = min(w, cx + r), min(h, cy + r)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            cam_dir = os.path.join(source_model_dir, roi["cam_label"])
+            os.makedirs(cam_dir, exist_ok=True)
+            crop = frame[y0:y1, x0:x1].copy()
+            # Circular crop, not a square bounding-box crop -- the ROI
+            # itself is a circle, so a square crop always carries four
+            # corners of irrelevant background (module housing, other
+            # cameras' edges, glare) that were never actually part of the
+            # camera lens area being inspected. Filled black (actual RGB
+            # zeroed, not just an alpha channel) rather than made
+            # transparent -- an alpha channel is silently dropped by most
+            # image loaders (PIL's convert('RGB'), cv2.imread without
+            # IMREAD_UNCHANGED) including whatever training pipeline reads
+            # these later, so transparency alone wouldn't reliably mask
+            # anything. A flat black corner is the same in every saved
+            # image (fixed camera + jig), so a position-based model
+            # (PatchCore/PaDiM) just learns it as part of the fixed normal
+            # background -- it isn't going to get confused into flagging it.
+            circ_mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+            cv2.circle(circ_mask, (cx - x0, cy - y0), r, 255, -1)
+            crop[circ_mask == 0] = 0
+            cv2.imwrite(os.path.join(cam_dir, f"crop_{ts}_{barcode}.png"), crop)
+
+            # AI anomaly-detection pass, on top of the z-score dust check --
+            # runs the exact same clean circular crop just saved above
+            # through that camera's trained model (if a technician has set
+            # one up in the AI Model tab and enabled AI detection). Uses
+            # cv2.countNonZero-free OR logic with the z-score result: this
+            # ROI's overall FAIL/PASS is decided by whichever findings end
+            # up in `blobs`, so simply appending here is enough -- the
+            # verdict below fails if EITHER this OR z-score found something.
+            if self.settings.get("ai_enabled") and self.ai_models.is_loaded(model, roi["cam_label"]):
+                result = self.ai_models.score(model, roi["cam_label"], crop)
+                if result is not None:
+                    score_val, is_anomalous = result
+                    if is_anomalous:
+                        blobs.append({
+                            "type": "ai_anomaly", "cx": float(cx), "cy": float(cy), "r": float(r),
+                            "diameter_px": None, "diameter_mm": None,
+                            "label": f"AI:{roi['cam_label']} {score_val:.3f}",
+                        })
+
+        verdict = "FAIL" if blobs else "PASS"
         result_disp = source_disp.copy()
         max_dia = None
         for b in blobs:
@@ -1457,10 +1957,11 @@ class DustInspectorApp:
             if b["type"] == "dust" and b.get("diameter_mm") is not None:
                 max_dia = max(max_dia or 0.0, b["diameter_mm"])
 
-        verdict_dir = RESULTS_NG_DIR if verdict == "FAIL" else RESULTS_OK_DIR
+        verdict_base_dir = RESULTS_NG_DIR if verdict == "FAIL" else RESULTS_OK_DIR
+        verdict_dir = os.path.join(verdict_base_dir, model_folder)
+        os.makedirs(verdict_dir, exist_ok=True)
         cv2.imwrite(os.path.join(verdict_dir, f"{verdict}_{ts}_{barcode}.png"), result_disp)
 
-        model, line = self.settings.get("model_name"), self.settings.get("line_name")
         log_ts = self._write_log_csv(model, line, barcode, verdict, len(blobs), max_dia)
         log_args = (log_ts, barcode, model, line, verdict, len(blobs), max_dia)
         return verdict, log_args
@@ -1471,7 +1972,8 @@ class DustInspectorApp:
         counts = {}
         for b in blobs:
             counts[b["type"]] = counts.get(b["type"], 0) + 1
-        lines = [f"- {counts[t]}x {t}" for t in ("dust", "thread", "glue", "scratch", "pit") if counts.get(t)]
+        labels = {"dust": "dust", "ai_anomaly": "AI-flagged anomaly"}
+        lines = [f"- {counts[t]}x {labels[t]}" for t in ("dust", "ai_anomaly") if counts.get(t)]
         return "\n".join(lines)
 
     def _finish_inspection(self, blobs, verdict, log_args):
@@ -1533,6 +2035,8 @@ class DustInspectorApp:
         self.settings["line_name"] = self.line_var.get().strip()
         save_settings(self.settings)
         self.model_line_var.set(self._model_line_text())
+        self._load_configured_ai_models()  # (model_name, cam_label) keys changed -- reload this model's AI models
+        self._refresh_ai_tab()
 
     # ---- ROI & Calibration --------------------------------------------
     def _build_roi_tab(self, tab):
@@ -1542,8 +2046,19 @@ class DustInspectorApp:
         self._btn_secondary(top, "Delete ROI", self.delete_selected_roi, width=100).pack(side="left", padx=6)
         self._btn_secondary(top, "Clear All", self.clear_rois, width=90).pack(side="left", padx=6)
         self._btn_secondary(top, "Save Layout", self.save_roi_layout, width=100).pack(side="left", padx=6)
+        self._btn_secondary(top, "Assign Camera Labels", self.assign_camera_labels, width=170).pack(side="left", padx=6)
         self._btn_secondary(top, "Fit", self.fit_roi_view, width=52).pack(side="left", padx=(20, 4))
         self._btn_secondary(top, "Test Detection", self.test_detection_once, width=130).pack(side="right")
+        # Test-Detection-only mode toggle -- lets a technician try the AI
+        # model (or compare it against z-score) WITHOUT going through the
+        # barcode/Start live-inspection flow. Only affects this button;
+        # live inspection always runs z-score + AI (when AI is enabled)
+        # together, same OR-logic verdict as before, regardless of this.
+        self.test_mode_display_var = tk.StringVar(value=TEST_MODE_TO_DISPLAY.get(self.settings.get("test_mode", "opencv"), "OpenCV only"))
+        ctk.CTkOptionMenu(top, values=list(TEST_MODE_TO_DISPLAY.values()), command=self._on_test_mode_change,
+                          variable=self.test_mode_display_var, fg_color=BG_CARD_ALT, button_color=BG_CARD_ALT,
+                          button_hover_color=BORDER, text_color=TEXT, dropdown_fg_color=BG_CARD_ALT,
+                          dropdown_hover_color=BORDER, dropdown_text_color=TEXT, width=170).pack(side="right", padx=(0, 10))
         self._btn_secondary(top, "View Pipeline Steps", self.view_pipeline_steps, width=150).pack(side="right", padx=(0, 6))
 
         body = ctk.CTkFrame(tab, fg_color="transparent")
@@ -1621,6 +2136,7 @@ class DustInspectorApp:
         self.selected_idx = None
         self._activate_roi_layout(name, rois)
         self._render_roi_canvas()
+        self._refresh_ai_tab()
         self.footer_var.set(f"Active ROI layout: {name}")
 
     def save_roi_layout(self):
@@ -1630,10 +2146,96 @@ class DustInspectorApp:
         name = simpledialog.askstring("Save ROI Layout", "Layout name (e.g. model_A56_main):", parent=self.root)
         if not name:
             return
+        _ensure_cam_labels(self.rois)  # every ROI must have a camN label before it's saved
+        self._render_roi_canvas()
         with open(os.path.join(ROI_DIR, f"{name}.json"), "w") as f:
             json.dump(self.rois, f, indent=2)
         self._refresh_layout_list()
         self.footer_var.set(f"Saved ROI layout: {name}")
+
+    def assign_camera_labels(self):
+        """Lets the technician assign/rename which physical camera position
+        (cam1, cam2, ...) each ROI on screen corresponds to. This is what
+        keeps a phone model's cameras -- which can differ in FOV/megapixel/
+        optics -- from getting mixed up on disk or in training later: every
+        saved image is filed under <Model>/<camN>/ using exactly the label
+        set here."""
+        if not self.rois:
+            messagebox.showinfo("Assign Camera Labels", "No ROIs yet -- add some first.")
+            return
+        _ensure_cam_labels(self.rois)  # default-fill so the dialog always starts with something sensible
+        self._render_roi_canvas()  # so the ROI{n} numbers behind the dialog match this dialog's rows right away
+
+        prior_selected = self.selected_idx
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Assign Camera Labels")
+        dlg.configure(bg=BG_CARD)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ctk.CTkLabel(dlg, text="Click a row (or its box) to highlight that exact ROI on the canvas behind this "
+                               "window, then type its camera position (cam1, cam2, ...).",
+                     font=self.f_small, text_color=TEXT_MUTED, wraplength=420, justify="left").pack(
+            anchor="w", padx=16, pady=(14, 8))
+
+        rows_frame = ctk.CTkFrame(dlg, fg_color="transparent")
+        rows_frame.pack(fill="both", expand=True, padx=16)
+
+        def highlight(i):
+            self.selected_idx = i
+            self._render_roi_canvas()
+
+        entries = []
+        for i, roi in enumerate(self.rois):
+            row = ctk.CTkFrame(rows_frame, fg_color="transparent")
+            row.pack(fill="x", pady=4)
+            ctk.CTkLabel(row, text=f"ROI {i + 1}  (x={int(roi['cx'])}, y={int(roi['cy'])})",
+                         font=self.f_small, text_color=TEXT, width=220, anchor="w").pack(side="left")
+            var = tk.StringVar(value=roi.get("cam_label") or f"cam{i + 1}")
+            entry = ctk.CTkEntry(row, textvariable=var, width=100)
+            entry.pack(side="left", padx=(8, 0))
+            # Focusing the box -- or just clicking its row -- highlights the
+            # matching ROI on the canvas in yellow, the same way clicking an
+            # ROI directly does, so there's no more guessing which entry
+            # belongs to which circle on screen.
+            entry.bind("<FocusIn>", lambda e, i=i: highlight(i))
+            row.bind("<Button-1>", lambda e, i=i: highlight(i))
+            self._btn_secondary(row, "Highlight", lambda i=i: highlight(i), width=90).pack(side="left", padx=(8, 0))
+            entries.append(var)
+
+        status_var = tk.StringVar(value="")
+        status_lbl = ctk.CTkLabel(dlg, textvariable=status_var, font=self.f_small, text_color=DANGER)
+        status_lbl.pack(anchor="w", padx=16, pady=(6, 0))
+
+        def on_save():
+            labels = [v.get().strip() for v in entries]
+            if any(not l for l in labels):
+                status_var.set("Every ROI needs a non-empty label.")
+                return
+            if len(set(labels)) != len(labels):
+                status_var.set("Camera labels must be unique -- two ROIs have the same label.")
+                return
+            for roi, lbl in zip(self.rois, labels):
+                roi["cam_label"] = lbl
+            self.selected_idx = prior_selected
+            self._render_roi_canvas()
+            self._refresh_ai_tab()
+            self.footer_var.set("Camera labels updated.")
+            dlg.destroy()
+
+        def on_cancel():
+            self.selected_idx = prior_selected
+            self._render_roi_canvas()
+            dlg.destroy()
+
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.pack(fill="x", padx=16, pady=14)
+        self._btn_primary(btns, "Save", on_save, width=100).pack(side="left")
+        self._btn_secondary(btns, "Cancel", on_cancel, width=100).pack(side="left", padx=(8, 0))
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+        if self.rois:
+            highlight(0)
 
     def delete_selected_roi(self):
         if self.selected_idx is not None and 0 <= self.selected_idx < len(self.rois):
@@ -1641,12 +2243,14 @@ class DustInspectorApp:
             self.selected_idx = None
             self._render_roi_canvas()
             self._render_main_feed()
+            self._refresh_ai_tab()
 
     def clear_rois(self):
         self.rois = []
         self.selected_idx = None
         self._render_roi_canvas()
         self._render_main_feed()
+        self._refresh_ai_tab()
 
     def open_image(self):
         path = filedialog.askopenfilename(
@@ -1667,36 +2271,119 @@ class DustInspectorApp:
         self._render_main_feed()
         self.footer_var.set(f"Loaded {os.path.basename(path)} (static -- live feed paused). Reconnect camera to resume live view.")
 
+    def _on_test_mode_change(self, display_value):
+        mode = DISPLAY_TO_TEST_MODE.get(display_value, "opencv")
+        self.settings["test_mode"] = mode
+        save_settings(self.settings)
+
     def test_detection_once(self):
         if self.original is None or not self.rois:
             messagebox.showinfo("Test Detection", "Need an image and at least one ROI.")
             return
-        self.footer_var.set("Running test detection...")
+        mode = self.settings.get("test_mode", "opencv")
+        self.footer_var.set(f"Running test detection ({TEST_MODE_TO_DISPLAY.get(mode, mode)})...")
         frame = self.original.copy()
         rois_snapshot = [dict(r) for r in self.rois]
-        threading.Thread(target=self._run_test_detection_thread, args=(frame, rois_snapshot), daemon=True).start()
+        threading.Thread(target=self._run_test_detection_thread, args=(frame, rois_snapshot, mode), daemon=True).start()
 
-    def _run_test_detection_thread(self, frame, rois_snapshot):
-        """Off the main thread -- a slow setting (e.g. a big gap_bridge_px)
-        must never be able to freeze the UI, no matter what's dialed in."""
+    def _run_test_detection_thread(self, frame, rois_snapshot, mode):
+        """Off the main thread so a slow detection pass never freezes the UI.
+        This is a standalone comparison tool, deliberately separate from the
+        barcode/Start live-inspection flow (_run_inspection_thread) -- it
+        never saves any images, writes the CSV log, or touches pass/fail
+        counters, so it's safe to click repeatedly while tuning."""
         s = self.settings
-        try:
-            blobs, stats, _dbg = run_full_detection(frame, rois_snapshot, s, debug=False)
-        except Exception:
-            blobs, stats = [], None
-        self.root.after(0, lambda: self._finish_test_detection(blobs, stats))
+        blobs, stats, ai_results = [], None, {}
 
-    def _finish_test_detection(self, blobs, stats):
+        if mode in ("opencv", "both"):
+            try:
+                _binary, blobs, stats, _dbg = run_zscore_detection(
+                    frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
+                    s.get("scale_mm_per_px"), s["min_diameter_mm"])
+            except Exception:
+                blobs, stats = [], None
+
+        if mode in ("ai", "both"):
+            model = s.get("model_name")
+            _ensure_cam_labels(rois_snapshot)
+            h, w = frame.shape[:2]
+            for roi in rois_snapshot:
+                cam_label = roi["cam_label"]
+                if not self.ai_models.is_loaded(model, cam_label):
+                    ai_results[cam_label] = {"error": "no model loaded"}
+                    continue
+                cx, cy, r = int(roi["cx"]), int(roi["cy"]), int(roi["r"])
+                x0, y0 = max(0, cx - r), max(0, cy - r)
+                x1, y1 = min(w, cx + r), min(h, cy + r)
+                if x1 <= x0 or y1 <= y0:
+                    ai_results[cam_label] = {"error": "ROI outside frame"}
+                    continue
+                crop = frame[y0:y1, x0:x1].copy()
+                circ_mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+                cv2.circle(circ_mask, (cx - x0, cy - y0), r, 255, -1)
+                crop[circ_mask == 0] = 0  # same black-filled circular crop used for training/live inspection
+                result = self.ai_models.score(model, cam_label, crop)
+                if result is None:
+                    ai_results[cam_label] = {"error": self.ai_models.last_error(model, cam_label) or "scoring failed"}
+                    continue
+                score_val, is_anomalous = result
+                ai_results[cam_label] = {"score": score_val, "threshold": self.ai_models.threshold(model, cam_label),
+                                          "anomalous": is_anomalous}
+                if is_anomalous:
+                    blobs.append({
+                        "type": "ai_anomaly", "cx": float(cx), "cy": float(cy), "r": float(r),
+                        "diameter_px": None, "diameter_mm": None,
+                        "label": f"AI:{cam_label} {score_val:.3f}",
+                    })
+
+        self.root.after(0, lambda: self._finish_test_detection(blobs, stats, mode, ai_results))
+
+    def _finish_test_detection(self, blobs, stats, mode, ai_results):
         self.last_blobs = blobs
         self._render_roi_canvas()
         self._render_main_feed()
-        counts = {}
-        for b in blobs:
-            counts[b["type"]] = counts.get(b["type"], 0) + 1
-        msg = ", ".join(f"{n} {t}" for t, n in counts.items()) or "no defects"
-        if stats:
-            msg += f" | max_z={stats['max_z']:.2f} rejected={stats['rejected']}"
-        self.footer_var.set("Test detection: " + msg)
+
+        parts = [f"Mode: {TEST_MODE_TO_DISPLAY.get(mode, mode)}"]
+
+        if mode in ("opencv", "both"):
+            counts = {}
+            for b in blobs:
+                if b["type"] == "dust":
+                    counts[b["type"]] = counts.get(b["type"], 0) + 1
+            dust_msg = ", ".join(f"{n} {t}" for t, n in counts.items()) or "no dust found"
+            if stats:
+                dust_msg += f" (max_z={stats['max_z']:.2f}, rejected={stats['rejected']})"
+            parts.append(f"OpenCV: {dust_msg}")
+
+        if mode in ("ai", "both"):
+            if not ai_results:
+                parts.append("AI: no cameras to score")
+            else:
+                ai_bits = []
+                for cam_label, r in sorted(ai_results.items()):
+                    if "error" in r:
+                        ai_bits.append(f"{cam_label}={r['error']}")
+                    else:
+                        verdict = "ANOMALY" if r["anomalous"] else "ok"
+                        ai_bits.append(f"{cam_label}={r['score']:.3f}/{r['threshold']:.3f} {verdict}")
+                parts.append("AI: " + ", ".join(ai_bits))
+
+        if mode == "both":
+            # A genuinely fused single probability would need the two
+            # detectors calibrated against each other, which there's no
+            # data for yet -- so this is a simple, clearly-labeled combined
+            # confidence (not a real probability): 1.0 if z-score found any
+            # dust, else each camera's AI score/threshold ratio (capped at
+            # 1.0), and the combined figure is the max across both. Good
+            # enough to eyeball "did either one react", not to trust as a
+            # calibrated number.
+            dust_found = any(b["type"] == "dust" for b in blobs)
+            ai_ratios = [min(r["score"] / r["threshold"], 1.5) if r["threshold"] else 0.0
+                         for r in ai_results.values() if "error" not in r and r["threshold"]]
+            combined = max([1.0 if dust_found else 0.0] + ai_ratios) if (dust_found or ai_ratios) else 0.0
+            parts.append(f"Combined confidence (uncalibrated): {combined:.2f}")
+
+        self.footer_var.set(" | ".join(parts))
 
     def view_pipeline_steps(self):
         if self.original is None or not self.rois:
@@ -1710,7 +2397,9 @@ class DustInspectorApp:
     def _run_pipeline_debug_thread(self, frame, rois_snapshot):
         s = self.settings
         try:
-            _blobs, _stats, debug_images = run_full_detection(frame, rois_snapshot, s, debug=True)
+            _binary, _blobs, _stats, debug_images = run_zscore_detection(
+                frame, rois_snapshot, s["window"], s["z_thr"], s["min_area"], s["min_circularity"],
+                s.get("scale_mm_per_px"), s["min_diameter_mm"], debug=True)
         except Exception:
             debug_images = None
         self.root.after(0, lambda: self._finish_pipeline_debug(debug_images))
@@ -1785,69 +2474,8 @@ class DustInspectorApp:
         self._field(row2, "Min dust diameter (mm)", self.min_diam_var, width=100).pack(side="left", padx=(0, 16))
 
         row3 = ctk.CTkFrame(card, fg_color="transparent")
-        row3.pack(fill="x", padx=18, pady=(0, 8))
-        self.min_aspect_var = tk.StringVar(value=str(self.settings["min_aspect_ratio"]))
-        self.max_thin_var = tk.StringVar(value=str(self.settings["max_thin_width_px"]))
-        self.arc_fit_var = tk.StringVar(value=str(self.settings["max_arc_fit_residual"]))
-        self._field(row3, "Min elongation ratio", self.min_aspect_var, width=90).pack(side="left", padx=(0, 16))
-        self._field(row3, "Max thread/arc width (px)", self.max_thin_var, width=110).pack(side="left", padx=(0, 16))
-        self._field(row3, "Arc-fit tolerance (0-1)", self.arc_fit_var, width=100).pack(side="left", padx=(0, 16))
-        ctk.CTkLabel(card, text="A thin elongated blob is rejected as an arc (lens/coating reflection) only if it cleanly fits ONE circle much bigger than itself -- a real thread can curve too, but essentially never traces a perfect large arc, so curvature alone no longer disqualifies it. Lower the tolerance to be stricter about what counts as a clean circle fit.",
-                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 8))
-
-        row4 = ctk.CTkFrame(card, fg_color="transparent")
-        row4.pack(fill="x", padx=18, pady=(0, 8))
-        self.gap_bridge_var = tk.StringVar(value=str(self.settings["gap_bridge_px"]))
-        self.z_thr_low_var = tk.StringVar(value=str(self.settings["z_thr_low"]))
-        self._field(row4, "Gap bridge (px)", self.gap_bridge_var, width=90).pack(side="left", padx=(0, 16))
-        self._field(row4, "Weak threshold (hysteresis)", self.z_thr_low_var, width=100).pack(side="left", padx=(0, 16))
-        self._btn_primary(row4, "Save", self._save_detection_settings, width=100).pack(side="left", pady=(18, 0))
-        ctk.CTkLabel(card, text="Two different fixes for a broken-up thread: Weak threshold recovers a FAINT tail that's still elevated in the z-score but below the main threshold (hysteresis: a weak pixel counts if it touches a strong one, same trick Canny edge detection uses). Gap bridge instead links pieces separated by a true GAP with no signal at all -- it can't invent detail hysteresis is the fix when the heatmap actually shows the thread, just not brightly enough everywhere; gap bridge is the fix when there's a real empty stretch in between.",
-                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 14))
-
-        # ---- scratch detection (structure-tensor anisotropy + Hough) ----
-        scratch_card = self._card(tab)
-        scratch_card.pack(fill="x", padx=20, pady=(0, 20))
-        shead = ctk.CTkFrame(scratch_card, fg_color="transparent")
-        shead.pack(fill="x", padx=18, pady=(16, 6))
-        ctk.CTkLabel(shead, text="Scratch Detection", font=self.f_section, text_color=TEXT).pack(side="left")
-        self.scratch_enabled_var = tk.BooleanVar(value=self.settings.get("scratch_enabled", True))
-        ctk.CTkSwitch(shead, text="Enabled", variable=self.scratch_enabled_var,
-                      onvalue=True, offvalue=False, font=self.f_small).pack(side="right")
-        row5 = ctk.CTkFrame(scratch_card, fg_color="transparent")
-        row5.pack(fill="x", padx=18, pady=(0, 8))
-        self.scratch_aniso_var = tk.StringVar(value=str(self.settings.get("scratch_aniso_thresh", 170)))
-        self.scratch_minlen_var = tk.StringVar(value=str(self.settings.get("scratch_min_length_px", 18.0)))
-        self.scratch_gap_var = tk.StringVar(value=str(self.settings.get("scratch_max_gap_px", 6.0)))
-        self._field(row5, "Anisotropy threshold (0-255)", self.scratch_aniso_var, width=110).pack(side="left", padx=(0, 16))
-        self._field(row5, "Min scratch length (px)", self.scratch_minlen_var, width=100).pack(side="left", padx=(0, 16))
-        self._field(row5, "Max line gap (px)", self.scratch_gap_var, width=90).pack(side="left", padx=(0, 16))
-        ctk.CTkLabel(scratch_card, text="Finds thin linear defects via local gradient direction (structure tensor) instead of brightness contrast -- catches faint scratches the dust/thread Z-score classifier can miss. Lower the anisotropy threshold to catch fainter scratches (more false positives); raise min length to ignore short noisy line fragments.",
-                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 14))
-
-        # ---- pitting detection (multi-scale top-hat/black-hat) ----
-        pit_card = self._card(tab)
-        pit_card.pack(fill="x", padx=20, pady=(0, 20))
-        phead = ctk.CTkFrame(pit_card, fg_color="transparent")
-        phead.pack(fill="x", padx=18, pady=(16, 6))
-        ctk.CTkLabel(phead, text="Pitting Detection", font=self.f_section, text_color=TEXT).pack(side="left")
-        self.pit_enabled_var = tk.BooleanVar(value=self.settings.get("pit_enabled", True))
-        ctk.CTkSwitch(phead, text="Enabled", variable=self.pit_enabled_var,
-                      onvalue=True, offvalue=False, font=self.f_small).pack(side="right")
-        row6 = ctk.CTkFrame(pit_card, fg_color="transparent")
-        row6.pack(fill="x", padx=18, pady=(0, 8))
-        self.pit_thresh_var = tk.StringVar(value=str(self.settings.get("pit_bin_thresh", 28)))
-        self.pit_minarea_var = tk.StringVar(value=str(self.settings.get("pit_min_area_px", 4.0)))
-        self.pit_ksmall_var = tk.StringVar(value=str(self.settings.get("pit_kernel_small", 11)))
-        self.pit_klarge_var = tk.StringVar(value=str(self.settings.get("pit_kernel_large", 19)))
-        self._field(row6, "Threshold (0-255)", self.pit_thresh_var, width=100).pack(side="left", padx=(0, 16))
-        self._field(row6, "Min pit area (px^2)", self.pit_minarea_var, width=100).pack(side="left", padx=(0, 16))
-        self._field(row6, "Small kernel (px)", self.pit_ksmall_var, width=90).pack(side="left", padx=(0, 16))
-        self._field(row6, "Large kernel (px)", self.pit_klarge_var, width=90).pack(side="left", padx=(0, 16))
-        ctk.CTkLabel(pit_card, text="Finds small bright or dark craters/pinholes via top-hat + black-hat morphology at two kernel sizes. Lower the threshold to catch shallower pits (more false positives from surface texture).",
-                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 8))
-        self._btn_primary(pit_card, "Save All Detection Settings", self._save_detection_settings, width=220).pack(
-            anchor="w", padx=18, pady=(0, 16))
+        row3.pack(fill="x", padx=18, pady=(0, 14))
+        self._btn_primary(row3, "Save", self._save_detection_settings, width=100).pack(side="left")
 
     def _save_detection_settings(self):
         try:
@@ -1857,25 +2485,133 @@ class DustInspectorApp:
             self.settings["min_area"] = float(self.min_area_var.get())
             self.settings["min_circularity"] = float(self.min_circ_var.get())
             self.settings["min_diameter_mm"] = float(self.min_diam_var.get())
-            self.settings["min_aspect_ratio"] = float(self.min_aspect_var.get())
-            self.settings["max_thin_width_px"] = float(self.max_thin_var.get())
-            self.settings["max_arc_fit_residual"] = float(self.arc_fit_var.get())
-            self.settings["gap_bridge_px"] = float(self.gap_bridge_var.get())
-            self.settings["z_thr_low"] = float(self.z_thr_low_var.get())
-            self.settings["scratch_enabled"] = bool(self.scratch_enabled_var.get())
-            self.settings["scratch_aniso_thresh"] = int(self.scratch_aniso_var.get())
-            self.settings["scratch_min_length_px"] = float(self.scratch_minlen_var.get())
-            self.settings["scratch_max_gap_px"] = float(self.scratch_gap_var.get())
-            self.settings["pit_enabled"] = bool(self.pit_enabled_var.get())
-            self.settings["pit_bin_thresh"] = int(self.pit_thresh_var.get())
-            self.settings["pit_min_area_px"] = float(self.pit_minarea_var.get())
-            self.settings["pit_kernel_small"] = int(self.pit_ksmall_var.get())
-            self.settings["pit_kernel_large"] = int(self.pit_klarge_var.get())
         except ValueError:
             messagebox.showerror("Settings", "All fields must be numbers.")
             return
         save_settings(self.settings)
         self.footer_var.set("Detection settings saved.")
+
+    # ---- AI anomaly-detection models (per camera) -------------------------
+    def _build_ai_tab(self, tab):
+        self._ai_row_widgets = {}  # cam_label -> {"status_var":..., "thr_var":...}
+
+        top_card = self._card(tab)
+        top_card.pack(fill="x", padx=20, pady=(20, 10))
+        ctk.CTkLabel(top_card, text="AI Anomaly Detection", font=self.f_section, text_color=TEXT).pack(anchor="w", padx=18, pady=(16, 6))
+        ctk.CTkLabel(
+            top_card,
+            text=("Optional: on top of the z-score dust check, run each camera's own ROI crop "
+                  "through a model trained in Training Studio (exported to ONNX). A camera FAILs "
+                  "if EITHER the z-score dust check OR its AI model flags an anomaly. Leave a "
+                  "camera's model unset to skip AI for it -- z-score detection keeps running "
+                  "regardless of this setting."),
+            font=self.f_small, text_color=TEXT_MUTED, wraplength=900, justify="left"
+        ).pack(anchor="w", padx=18, pady=(0, 10))
+
+        self.ai_enabled_var = tk.BooleanVar(value=bool(self.settings.get("ai_enabled", False)))
+        ctk.CTkSwitch(top_card, text="Enable AI anomaly detection", variable=self.ai_enabled_var,
+                      command=self._save_ai_enabled, font=self.f_body,
+                      progress_color=ACCENT).pack(anchor="w", padx=18, pady=(0, 16))
+
+        self.ai_rows_card = self._card(tab)
+        self.ai_rows_card.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        ctk.CTkLabel(self.ai_rows_card, text="Per-Camera Models", font=self.f_section, text_color=TEXT).pack(anchor="w", padx=18, pady=(16, 10))
+        self.ai_rows_container = ctk.CTkFrame(self.ai_rows_card, fg_color="transparent")
+        self.ai_rows_container.pack(fill="both", expand=True, padx=18, pady=(0, 16))
+
+        self._refresh_ai_tab()
+
+    def _refresh_ai_tab(self):
+        """Rebuilds the per-camera model rows from the currently active
+        ROI layout's cam_labels. Called on teaching-page load and whenever
+        the ROI layout (and therefore the set of cameras) might have
+        changed."""
+        for child in self.ai_rows_container.winfo_children():
+            child.destroy()
+        self._ai_row_widgets = {}
+
+        _ensure_cam_labels(self.rois)
+        cam_labels = sorted({roi["cam_label"] for roi in self.rois}) if self.rois else []
+        if not cam_labels:
+            ctk.CTkLabel(self.ai_rows_container, text="No ROIs defined yet -- set up ROI & Calibration first.",
+                         font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w")
+            return
+
+        model = self.settings.get("model_name")
+        for cam_label in cam_labels:
+            row = ctk.CTkFrame(self.ai_rows_container, fg_color=BG_CARD_ALT, corner_radius=10)
+            row.pack(fill="x", pady=(0, 8))
+
+            ctk.CTkLabel(row, text=cam_label, font=self.f_body, text_color=TEXT, width=70).pack(side="left", padx=(12, 10), pady=10)
+
+            status_var = tk.StringVar(value=self._ai_status_text(model, cam_label))
+            ctk.CTkLabel(row, textvariable=status_var, font=self.f_small, text_color=TEXT_MUTED,
+                         wraplength=380, justify="left").pack(side="left", padx=(0, 10), pady=10)
+
+            thr_var = tk.StringVar(value=f"{self.ai_models.threshold(model, cam_label):.4f}")
+            self._ai_row_widgets[cam_label] = {"status_var": status_var, "thr_var": thr_var}
+
+            self._field(row, "Threshold", thr_var, width=80).pack(side="left", padx=(0, 10), pady=10)
+            self._btn_secondary(row, "Set", lambda c=cam_label: self._set_ai_threshold(c), width=60).pack(side="left", padx=(0, 10), pady=10)
+            self._btn_primary(row, "Browse .onnx", lambda c=cam_label: self._browse_ai_model(c), width=120).pack(side="left", padx=(0, 10), pady=10)
+            self._btn_secondary(row, "Unload", lambda c=cam_label: self._unload_ai_model(c), width=80).pack(side="left", padx=(0, 12), pady=10)
+
+    def _ai_status_text(self, model, cam_label):
+        if not ONNXRUNTIME_AVAILABLE:
+            return "onnxruntime not installed in this environment -- AI detection unavailable."
+        if self.ai_models.is_loaded(model, cam_label):
+            return f"Loaded: {self.ai_models.loaded_path(model, cam_label)}"
+        err = self.ai_models.last_error(model, cam_label)
+        return f"Not loaded ({err})" if err else "No model set for this camera."
+
+    def _save_ai_enabled(self):
+        self.settings["ai_enabled"] = bool(self.ai_enabled_var.get())
+        save_settings(self.settings)
+        self.footer_var.set(("AI anomaly detection enabled." if self.settings["ai_enabled"]
+                              else "AI anomaly detection disabled -- z-score dust detection only."))
+
+    def _browse_ai_model(self, cam_label):
+        path = filedialog.askopenfilename(title=f"Select trained ONNX model for {cam_label}",
+                                           filetypes=[("ONNX model", "*.onnx"), ("All files", "*.*")])
+        if not path:
+            return
+        model = self.settings.get("model_name")
+        key = AIModelManager._key(model, cam_label)
+        ok, err = self.ai_models.load(model, cam_label, path)
+        if ok:
+            self.settings.setdefault("ai_model_paths", {})[key] = path
+            self.settings.setdefault("ai_thresholds", {})[key] = self.ai_models.threshold(model, cam_label)
+            save_settings(self.settings)
+            self.footer_var.set(f"AI model loaded for {cam_label}.")
+        else:
+            messagebox.showerror("AI Model", f"Could not load model for {cam_label}:\n{err}")
+        self._refresh_ai_tab()
+
+    def _unload_ai_model(self, cam_label):
+        model = self.settings.get("model_name")
+        key = AIModelManager._key(model, cam_label)
+        self.ai_models.unload(model, cam_label)
+        self.settings.get("ai_model_paths", {}).pop(key, None)
+        self.settings.get("ai_thresholds", {}).pop(key, None)
+        save_settings(self.settings)
+        self.footer_var.set(f"AI model unloaded for {cam_label}.")
+        self._refresh_ai_tab()
+
+    def _set_ai_threshold(self, cam_label):
+        widgets = self._ai_row_widgets.get(cam_label)
+        if not widgets:
+            return
+        try:
+            value = float(widgets["thr_var"].get())
+        except ValueError:
+            messagebox.showerror("AI Model", "Threshold must be a number.")
+            return
+        model = self.settings.get("model_name")
+        self.ai_models.set_threshold(model, cam_label, value)
+        key = AIModelManager._key(model, cam_label)
+        self.settings.setdefault("ai_thresholds", {})[key] = value
+        save_settings(self.settings)
+        self.footer_var.set(f"Threshold for {cam_label} set to {value:.4f}.")
 
     # ---- Camera settings -------------------------------------------------
     def _build_camera_tab(self, tab):
@@ -1897,6 +2633,28 @@ class DustInspectorApp:
         self._btn_secondary(row, "Connect / Reconnect", self._reconnect_camera, width=160).pack(side="left", pady=(18, 0))
         ctk.CTkLabel(card, text="Gain amplifies sensor noise along with brightness -- prefer raising Exposure over Gain.",
                      font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 14))
+
+        storage_card = self._card(tab)
+        storage_card.pack(fill="x", padx=20, pady=(0, 20))
+        ctk.CTkLabel(storage_card, text="Storage Location", font=self.f_section, text_color=TEXT).pack(anchor="w", padx=18, pady=(16, 6))
+        self.storage_path_var = tk.StringVar(value=STORAGE_DIR)
+        ctk.CTkLabel(storage_card, textvariable=self.storage_path_var, font=self.f_small, text_color=TEXT_MUTED,
+                     wraplength=520, justify="left").pack(anchor="w", padx=18, pady=(0, 10))
+        self._btn_secondary(storage_card, "Select Location", self.select_storage_location, width=160).pack(anchor="w", padx=18, pady=(0, 8))
+        ctk.CTkLabel(storage_card, text="source_images/, results/, roi_configs/, and logs/ will be created inside whatever folder you pick. Existing files already saved don't move -- only new saves go to the new location.",
+                     font=self.f_small, text_color=TEXT_MUTED).pack(anchor="w", padx=18, pady=(0, 16))
+
+    def select_storage_location(self):
+        new_path = filedialog.askdirectory(title="Select folder for saved images, logs, and ROI configs",
+                                            initialdir=STORAGE_DIR)
+        if not new_path:
+            return
+        _apply_storage_base(new_path)
+        self.settings["storage_base_path"] = new_path
+        save_settings(self.settings)
+        self.storage_path_var.set(STORAGE_DIR)
+        self._refresh_layout_list()
+        self.footer_var.set(f"Storage location changed to: {STORAGE_DIR}")
 
     def _apply_camera_settings(self):
         try:
@@ -2041,7 +2799,7 @@ class DustInspectorApp:
                 default_r = int(self.radius_var.get())
             except (ValueError, AttributeError):
                 default_r = self.settings["default_radius"]
-            self.rois.append({"cx": ix, "cy": iy, "r": default_r})
+            self.rois.append({"cx": ix, "cy": iy, "r": default_r, "cam_label": None})
             self.selected_idx = len(self.rois) - 1
         self._render_roi_canvas()
         self._render_main_feed()
@@ -2052,8 +2810,19 @@ class DustInspectorApp:
             color = (0, 255, 255) if i == self.selected_idx else (0, 255, 0)
             cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), int(roi["r"]), color, 2)
             cv2.circle(disp, (int(roi["cx"]), int(roi["cy"])), 5, color, -1)
-            cv2.putText(disp, str(i + 1), (int(roi["cx"]) + 10, int(roi["cy"]) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            # Always show BOTH the ROI's on-screen number and its assigned
+            # camera label (e.g. "ROI2: cam2") so the two never need to be
+            # cross-referenced by hand -- this is the same "ROI N" wording
+            # used in the Assign Camera Labels dialog, so a row there maps
+            # straight onto what's drawn here. A filled background box
+            # behind the text keeps it readable over any image content.
+            label_text = f"ROI{i + 1}: {roi.get('cam_label')}" if roi.get("cam_label") else f"ROI{i + 1}: (unlabeled)"
+            font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2
+            (tw, th), baseline = cv2.getTextSize(label_text, font, scale, thick)
+            tx = int(roi["cx"]) + 12
+            ty = int(roi["cy"]) - 12
+            cv2.rectangle(disp, (tx - 4, ty - th - 6), (tx + tw + 4, ty + baseline + 4), (0, 0, 0), -1)
+            cv2.putText(disp, label_text, (tx, ty), font, scale, color, thick, cv2.LINE_AA)
         for b in self.last_blobs:
             cx, cy, r = int(b["cx"]), int(b["cy"]), int(round(b["r"]))
             cv2.circle(disp, (cx, cy), r + 4, BLOB_COLOR_BGR.get(b["type"], (0, 0, 255)), 2)
